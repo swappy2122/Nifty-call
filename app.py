@@ -1115,5 +1115,5 @@ iframe {
 </style>
 """, unsafe_allow_html=True)
 
-# Render high-performance WebSocket terminal inside Streamlit
-components.html(HTML_TEMPLATE, height=1400, scrolling=True)
+# Render high-performance WebSocket terminal inside Streamlit using st.iframe
+st.iframe("http://localhost:8000/", height=1400, width="stretch")
