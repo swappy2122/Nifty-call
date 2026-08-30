@@ -1199,7 +1199,7 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
         )
         st.plotly_chart(
             build_candlestick_chart(enriched_df, pred.signal, tech),
-            use_container_width=True, config={"displayModeBar": False},
+            width="stretch", config={"displayModeBar": False},
         )
 
         # ── Bottom Charts: PCR Gauge + OI Bar ──
@@ -1211,7 +1211,7 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
             )
             st.plotly_chart(
                 build_pcr_gauge(chain.pcr),
-                use_container_width=True, config={"displayModeBar": False},
+                width="stretch", config={"displayModeBar": False},
             )
         with bc2:
             st.markdown(
@@ -1220,7 +1220,7 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
             )
             st.plotly_chart(
                 build_oi_chart(chain.df_chain, chain.atm_strike),
-                use_container_width=True, config={"displayModeBar": False},
+                width="stretch", config={"displayModeBar": False},
             )
 
         # ── Rationale Expander ──
@@ -1231,7 +1231,7 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
             if headlines:
                 st.markdown("**Latest Headlines Scored:**")
                 hdf = pd.DataFrame(headlines)
-                st.dataframe(hdf, use_container_width=True, hide_index=True)
+                st.dataframe(hdf, width="stretch", hide_index=True)
 
 
 # ── Footer with Auto-Refresh ──
