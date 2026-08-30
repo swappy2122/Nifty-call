@@ -22,7 +22,7 @@ import re
 import textwrap
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -120,6 +120,17 @@ class OptionChainSnapshot:
     )
 
 
+def is_nse_market_open() -> bool:
+    """Check if current IST time is within NSE market hours (Mon-Fri, 09:15 to 15:30 IST)."""
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(ist)
+    if now.weekday() >= 5:  # Saturday or Sunday
+        return False
+    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return start <= now <= end
+
+
 def generate_option_chain_snapshot(
     symbol: str, access_token: Optional[str] = None
 ) -> OptionChainSnapshot:
@@ -131,9 +142,15 @@ def generate_option_chain_snapshot(
     cfg = INSTRUMENT_CONFIG[symbol]
     step = cfg["step"]
 
-    # Deterministic seed that changes every 15 seconds for live-feel
-    tick_seed = int(time.time() // 15)
-    np.random.seed(tick_seed + hash(symbol) % 10000)
+    market_open = is_nse_market_open()
+    if not market_open:
+        # Frozen static snapshot when market is closed
+        tick_seed = 1000 + hash(symbol) % 10000
+    else:
+        # Dynamic tick seed that updates every 15s during market hours
+        tick_seed = int(time.time() // 15) + hash(symbol) % 10000
+
+    np.random.seed(tick_seed)
 
     jitter = float(np.random.normal(0, 6.0 if symbol == "NIFTY" else 22.0))
     spot = round(cfg["base_spot"] + jitter, 2)
@@ -308,6 +325,7 @@ def _score_headline_lexicon(text: str) -> float:
     return 0.0
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def fetch_and_score_sentiment() -> Tuple[float, int, List[Dict[str, Any]]]:
     """
     Scrape RSS feeds and score with FinBERT (or lexicon fallback).
@@ -364,42 +382,55 @@ def fetch_and_score_sentiment() -> Tuple[float, int, List[Dict[str, Any]]]:
 # ║  MODULE 3: TECHNICAL & MOMENTUM ENGINE (5-Min OHLCV)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-def generate_5min_ohlcv(base_price: float, bars: int = 78) -> pd.DataFrame:
-    """Generate realistic 5-minute OHLCV candles with trend/mean-revert phases."""
-    tick_seed = int(time.time() // 15)
-    np.random.seed(tick_seed + int(base_price) % 10000)
+def generate_5min_ohlcv(symbol: str, base_price: float, bars: int = 78) -> pd.DataFrame:
+    """Generate realistic 5-minute OHLCV candles with persistence in session state."""
+    market_open = is_nse_market_open()
 
-    # Introduce trend phases
-    phase_len = bars // 3
-    trend1 = np.random.normal(0.0003, 0.0015, phase_len)
-    trend2 = np.random.normal(-0.0001, 0.0020, phase_len)
-    trend3 = np.random.normal(0.0002, 0.0012, bars - 2 * phase_len)
-    returns = np.concatenate([trend1, trend2, trend3])
+    if "candle_buffers" not in st.session_state:
+        st.session_state.candle_buffers = {}
 
-    closes = base_price * np.cumprod(1 + returns)
-    highs = closes * (1 + np.abs(np.random.normal(0, 0.0012, bars)))
-    lows = closes * (1 - np.abs(np.random.normal(0, 0.0012, bars)))
-    opens = np.roll(closes, 1)
-    opens[0] = base_price
+    if not market_open or symbol not in st.session_state.candle_buffers:
+        seed = 2000 + hash(symbol) % 10000 if not market_open else int(time.time() // 15) + hash(symbol) % 10000
+        np.random.seed(seed)
 
-    # Volume with intraday pattern (higher at open/close)
-    vol_base = np.random.randint(8000, 45000, bars).astype(float)
-    intraday_pattern = np.concatenate([
-        np.linspace(1.8, 0.7, bars // 3),
-        np.linspace(0.7, 0.6, bars // 3),
-        np.linspace(0.6, 1.5, bars - 2 * (bars // 3)),
-    ])
-    volumes = (vol_base * intraday_pattern).astype(int)
+        phase_len = bars // 3
+        trend1 = np.random.normal(0.0003, 0.0015, phase_len)
+        trend2 = np.random.normal(-0.0001, 0.0020, phase_len)
+        trend3 = np.random.normal(0.0002, 0.0012, bars - 2 * phase_len)
+        returns = np.concatenate([trend1, trend2, trend3])
 
-    # Timestamps
-    now = pd.Timestamp.now().normalize() + pd.Timedelta(hours=9, minutes=15)
-    timestamps = pd.date_range(now, periods=bars, freq="5min")
+        closes = base_price * np.cumprod(1 + returns)
+        highs = closes * (1 + np.abs(np.random.normal(0, 0.0012, bars)))
+        lows = closes * (1 - np.abs(np.random.normal(0, 0.0012, bars)))
+        opens = np.roll(closes, 1)
+        opens[0] = base_price
 
-    return pd.DataFrame({
-        "timestamp": timestamps,
-        "open": opens, "high": highs, "low": lows,
-        "close": closes, "volume": volumes,
-    })
+        vol_base = np.random.randint(8000, 45000, bars).astype(float)
+        intraday_pattern = np.concatenate([
+            np.linspace(1.8, 0.7, bars // 3),
+            np.linspace(0.7, 0.6, bars // 3),
+            np.linspace(0.6, 1.5, bars - 2 * (bars // 3)),
+        ])
+        volumes = (vol_base * intraday_pattern).astype(int)
+
+        now = pd.Timestamp.now().normalize() + pd.Timedelta(hours=9, minutes=15)
+        timestamps = pd.date_range(now, periods=bars, freq="5min")
+
+        df = pd.DataFrame({
+            "timestamp": timestamps,
+            "open": opens, "high": highs, "low": lows,
+            "close": closes, "volume": volumes,
+        })
+        st.session_state.candle_buffers[symbol] = df
+    else:
+        df = st.session_state.candle_buffers[symbol].copy()
+        last_idx = len(df) - 1
+        df.loc[last_idx, "close"] = base_price
+        df.loc[last_idx, "high"] = max(df.loc[last_idx, "high"], base_price)
+        df.loc[last_idx, "low"] = min(df.loc[last_idx, "low"], base_price)
+        st.session_state.candle_buffers[symbol] = df
+
+    return st.session_state.candle_buffers[symbol]
 
 
 @dataclass
@@ -423,6 +454,7 @@ class TechnicalState:
     price_action_score: float  # [-1, +1]
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def compute_technicals(df: pd.DataFrame) -> Tuple[pd.DataFrame, TechnicalState]:
     """Calculate all technical indicators and return enriched DataFrame + latest state."""
     d = df.copy()
@@ -910,8 +942,9 @@ def build_candlestick_chart(
         line=dict(color="#FFD600", width=1), name="Vol EMA 20",
     ), row=2, col=1)
 
-    # Dark theme layout
+    # Dark theme layout with uirevision to prevent chart zoom flicker
     fig.update_layout(
+        uirevision=True,
         height=500,
         margin=dict(t=10, b=10, l=8, r=8),
         paper_bgcolor="#0e1117",
@@ -956,6 +989,7 @@ def build_pcr_gauge(pcr: float) -> go.Figure:
         },
     ))
     fig.update_layout(
+        uirevision=True,
         height=145, margin=dict(t=12, b=8, l=18, r=18),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#ECEFF1"),
@@ -980,6 +1014,7 @@ def build_oi_chart(df: pd.DataFrame, atm_strike: float) -> go.Figure:
         annotation_font=dict(size=9, color="#00E5FF"),
     )
     fig.update_layout(
+        uirevision=True,
         barmode="group", height=200,
         margin=dict(t=18, b=14, l=8, r=8),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -1129,13 +1164,21 @@ st.markdown(DARK_CSS, unsafe_allow_html=True)
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 # ── Header Bar ──
-hdr1, hdr2 = st.columns([2.8, 1.2])
+hdr1, hdr2 = st.columns([2.6, 1.4])
 with hdr1:
+    m_badge = (
+        '<span style="font-size:0.75rem;font-weight:700;background:rgba(0,230,118,0.1);color:#00E676;'
+        'padding:3px 9px;border-radius:10px;border:1px solid #00E676;margin-left:8px;">🟢 MARKET OPEN</span>'
+        if is_nse_market_open() else
+        '<span style="font-size:0.75rem;font-weight:700;background:rgba(255,23,68,0.1);color:#FF1744;'
+        'padding:3px 9px;border-radius:10px;border:1px solid #FF1744;margin-left:8px;">🔴 MARKET CLOSED</span>'
+    )
     st.markdown(
         '<div style="display:flex;align-items:center;">'
         '<span class="live-dot"></span>'
         '<span style="font-size:1.3rem;font-weight:900;color:#FFF;">ALGO RADAR</span>'
         '<span class="sp">v3.0 AI</span>'
+        f'{m_badge}'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -1145,6 +1188,34 @@ with hdr2:
         f'{datetime.now(timezone.utc).strftime("%H:%M UTC")}</div>',
         unsafe_allow_html=True,
     )
+
+# Active Trade Locking Manager
+if "active_trades" not in st.session_state:
+    st.session_state.active_trades = {"NIFTY": None, "BANKNIFTY": None}
+
+def lock_or_update_trade(sym: str, prediction: PredictionResult) -> PredictionResult:
+    active = st.session_state.active_trades.get(sym)
+    if active is None:
+        if prediction.signal in ("BUY_ATM_CE", "BUY_ATM_PE") and prediction.entry_premium > 0:
+            st.session_state.active_trades[sym] = {
+                "signal": prediction.signal,
+                "strike": prediction.strike,
+                "option_type": prediction.option_type,
+                "entry_premium": prediction.entry_premium,
+                "stop_loss": prediction.stop_loss,
+                "target": prediction.target,
+            }
+    else:
+        if prediction.signal == "NO_TRADE" or prediction.signal != active["signal"]:
+            st.session_state.active_trades[sym] = None
+        else:
+            prediction.entry_premium = active["entry_premium"]
+            prediction.stop_loss = active["stop_loss"]
+            prediction.target = active["target"]
+            prediction.strike = active["strike"]
+            prediction.option_type = active["option_type"]
+            prediction.signal = active["signal"]
+    return prediction
 
 # ── Sidebar Config ──
 with st.sidebar:
@@ -1164,10 +1235,11 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
     with tabs[idx]:
         # ── Data Pipeline ──
         chain = generate_option_chain_snapshot(symbol, access_token=upstox_token)
-        ohlcv = generate_5min_ohlcv(chain.spot)
+        ohlcv = generate_5min_ohlcv(symbol, chain.spot)
         enriched_df, tech = compute_technicals(ohlcv)
         sent_score, n_headlines, headlines = fetch_and_score_sentiment()
         pred = run_prediction_engine(chain, tech, sent_score)
+        pred = lock_or_update_trade(symbol, pred)
 
         # ── Signal Styles ──
         if pred.signal == "BUY_ATM_CE":
