@@ -1,16 +1,13 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
- ALGO RADAR v5 — Institutional-Grade Pure Streamlit Terminal
- NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Dashboard
+ ALGO RADAR v5 — UNIFIED STREAMLIT + FASTAPI WEBSOCKET TERMINAL
+ NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Engine
 ═══════════════════════════════════════════════════════════════════════════════
- 100% Pure Streamlit application optimized for Streamlit Cloud deployment.
  Features:
-  - Upstox API v2 / High-fidelity option chain simulation
-  - FinBERT AI News Sentiment (Moneycontrol & ET RSS)
-  - 5-Min Multi-Indicator Technical Engine (VWAP, Supertrend, 9/21 EMA, ADX)
+  - Runs FastAPI + Async WebSocket server in background daemon thread inside app.py
+  - Renders luxury Apple/Bloomberg Dark Terminal with TradingView Lightweight Charts v4.x
+  - Zero-flicker 2-second live WebSocket streaming directly in Streamlit
   - Multi-Agent AI Consensus Radar (35% PA + 35% OI + 15% Sent + 15% Greeks)
-  - Plotly Candlestick Chart with Entry/SL/Target overlays & uirevision zoom lock
-  - Active Trade Locking in st.session_state (locks SL/Target across refreshes)
   - NSE Market Hours check with static data freeze when closed
 
  Run: streamlit run app.py
@@ -19,59 +16,61 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import re
-import textwrap
+import socket
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
-# Optional heavy imports with fallbacks
+# Optional heavy imports with graceful fallbacks
 try:
     import feedparser
-    _HAS_FEEDPARSER = True
+    _HAS_FP = True
 except ImportError:
-    _HAS_FEEDPARSER = False
+    _HAS_FP = False
 
-import requests
+try:
+    from transformers import pipeline as hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer
+    _HAS_TF = True
+except ImportError:
+    _HAS_TF = False
 
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  STREAMLIT PAGE CONFIGURATION                                          ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-st.set_page_config(
-    page_title="Algo Radar v5 | NIFTY & BANKNIFTY",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+import requests as http_req
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  CONSTANTS & REGISTRY                                                   ║
+# ║  FASTAPI APPLICATION & CONSTANTS                                        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-INSTRUMENT_CONFIG = {
-    "NIFTY": {"step": 50.0, "base_spot": 24535.0, "lot_size": 25, "base_vix": 13.5},
-    "BANKNIFTY": {"step": 100.0, "base_spot": 51320.0, "lot_size": 15, "base_vix": 15.2},
+app = FastAPI(title="Algo Radar v5", version="5.0.0")
+
+INSTRUMENTS = {
+    "NIFTY": {"step": 50.0, "base": 24535.0, "lot": 25, "vix": 13.5},
+    "BANKNIFTY": {"step": 100.0, "base": 51320.0, "lot": 15, "vix": 15.2},
 }
 
-BULL_LEXICON = frozenset({"surge","rally","jump","gain","bull","high","growth","boost",
+BULL_LEX = frozenset({"surge","rally","jump","gain","bull","high","growth","boost",
     "outperform","record","upgrade","breakout","positive","profit","optimis",
     "recover","strong","uptick","buy","bullish"})
-BEAR_LEXICON = frozenset({"fall","drop","plunge","loss","bear","low","decline","crash",
+BEAR_LEX = frozenset({"fall","drop","plunge","loss","bear","low","decline","crash",
     "slump","drag","sell","downgrade","correction","weak","fear","pessimis",
     "warning","risk","concern","bearish"})
 
 RSS_FEEDS = {
-    "Moneycontrol_Markets": "https://www.moneycontrol.com/rss/marketreports.xml",
-    "Moneycontrol_Latest": "https://www.moneycontrol.com/rss/latestnews.xml",
+    "MC_Markets": "https://www.moneycontrol.com/rss/marketreports.xml",
+    "MC_Latest": "https://www.moneycontrol.com/rss/latestnews.xml",
     "ET_Markets": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
 }
 
@@ -80,7 +79,7 @@ RSS_FEEDS = {
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def is_nse_market_open() -> bool:
-    """Check if current IST time is within NSE market hours (Mon-Fri, 09:15 to 15:30 IST)."""
+    """Check if current IST time is within NSE market hours (Mon-Fri, 09:15-15:30 IST)."""
     ist = timezone(timedelta(hours=5, minutes=30))
     now = datetime.now(ist)
     if now.weekday() >= 5:  # Saturday or Sunday
@@ -91,46 +90,15 @@ def is_nse_market_open() -> bool:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 1: OPTION CHAIN SNAPSHOT GENERATOR                              ║
+# ║  MODULE 1: OPTION CHAIN & DERIVATIVES ENGINE                           ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-
-@dataclass
-class OptionChainSnapshot:
-    symbol: str
-    spot: float
-    day_high: float
-    day_low: float
-    vix: float
-    atm_strike: float
-    max_pain: float
-    total_call_oi: int
-    total_put_oi: int
-    pcr: float
-    pcr_prev: float
-    pcr_shift: float
-    atm_ce_ltp: float
-    atm_pe_ltp: float
-    atm_ce_iv: float
-    atm_pe_iv: float
-    atm_ce_delta: float
-    atm_pe_delta: float
-    call_unwinding: bool
-    put_unwinding: bool
-    call_writing: bool
-    put_writing: bool
-    simultaneous_writing: bool
-    df_chain: pd.DataFrame
-    expiry_date: str
-    market_open: bool
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
 
 _tick_state: Dict[str, float] = {}
 
 def _walk_spot(symbol: str) -> float:
-    cfg = INSTRUMENT_CONFIG[symbol]
+    cfg = INSTRUMENTS[symbol]
     if symbol not in _tick_state:
-        _tick_state[symbol] = cfg["base_spot"]
+        _tick_state[symbol] = cfg["base"]
     if not is_nse_market_open():
         return _tick_state[symbol]
     drift = float(np.random.normal(0, 0.0002)) * _tick_state[symbol]
@@ -138,8 +106,8 @@ def _walk_spot(symbol: str) -> float:
     return _tick_state[symbol]
 
 
-def generate_option_chain_snapshot(symbol: str, access_token: Optional[str] = None) -> OptionChainSnapshot:
-    cfg = INSTRUMENT_CONFIG[symbol]
+def generate_chain(symbol: str) -> dict:
+    cfg = INSTRUMENTS[symbol]
     step = cfg["step"]
     spot = _walk_spot(symbol)
 
@@ -147,796 +115,1005 @@ def generate_option_chain_snapshot(symbol: str, access_token: Optional[str] = No
     seed = 1000 + hash(symbol) % 10000 if not market_open else int(time.time() // 15) + hash(symbol) % 10000
     np.random.seed(seed)
 
-    vix = round(cfg["base_vix"] + float(np.random.normal(0, 0.3)), 2)
+    vix = round(cfg["vix"] + float(np.random.normal(0, 0.3)), 2)
     day_high = round(spot + abs(float(np.random.normal(35, 12))), 2)
     day_low = round(spot - abs(float(np.random.normal(30, 10))), 2)
+    atm = round(spot / step) * step
 
-    atm_strike = round(spot / step) * step
-    strikes = [atm_strike + i * step for i in range(-5, 6)]
+    strikes = [atm + i * step for i in range(-5, 6)]
     rows = []
-
     for s in strikes:
         dist = s - spot
-        moneyness = dist / spot
-        base_c_oi = int(np.random.randint(30000, 200000))
-        base_p_oi = int(np.random.randint(30000, 200000))
-        if dist > 0: base_c_oi = int(base_c_oi * (1 + abs(moneyness) * 8))
-        else: base_p_oi = int(base_p_oi * (1 + abs(moneyness) * 8))
+        m = dist / spot
+        bc = int(np.random.randint(30000, 200000))
+        bp = int(np.random.randint(30000, 200000))
+        if dist > 0: bc = int(bc * (1 + abs(m) * 8))
+        else: bp = int(bp * (1 + abs(m) * 8))
+        cc = int(np.random.randint(-35000, 30000))
+        pc = int(np.random.randint(-20000, 55000))
+        aiv = 12.0 + float(np.random.uniform(-1, 1))
+        civ = round(aiv + abs(m) * 50 + float(np.random.uniform(-0.5, 0.5)), 2)
+        piv = round(aiv + abs(m) * 55 + float(np.random.uniform(-0.5, 0.5)), 2)
+        ic = max(0, spot - s); ip_ = max(0, s - spot)
+        tv = max(5.0, 80 - abs(dist) * 0.6) * (1 + civ / 100)
+        cl = round(max(2.0, ic + tv + float(np.random.uniform(-3, 3))), 2)
+        pl = round(max(2.0, ip_ + tv + float(np.random.uniform(-3, 3))), 2)
+        cd = round(max(0.05, min(0.95, 0.5 + (spot - s) / (spot * 0.05))), 3)
+        rows.append({"strike": float(s), "c_oi": bc, "c_chg": cc, "c_ltp": cl,
+                      "c_iv": civ, "c_delta": cd, "c_vol": int(np.random.randint(10000, 400000)),
+                      "p_oi": bp, "p_chg": pc, "p_ltp": pl, "p_iv": piv,
+                      "p_delta": round(cd - 1, 3), "p_vol": int(np.random.randint(10000, 400000))})
 
-        c_chg = int(np.random.randint(-35000, 30000))
-        p_chg = int(np.random.randint(-20000, 55000))
-        atm_iv = 12.0 + np.random.uniform(-1, 1)
-        c_iv = round(atm_iv + abs(moneyness) * 50 + np.random.uniform(-0.5, 0.5), 2)
-        p_iv = round(atm_iv + abs(moneyness) * 55 + np.random.uniform(-0.5, 0.5), 2)
-
-        intrinsic_c = max(0, spot - s); intrinsic_p = max(0, s - spot)
-        time_val = max(5.0, 80 - abs(dist) * 0.6) * (1 + c_iv / 100)
-        c_ltp = max(2.0, round(intrinsic_c + time_val + np.random.uniform(-3, 3), 2))
-        p_ltp = max(2.0, round(intrinsic_p + time_val + np.random.uniform(-3, 3), 2))
-        c_delta = round(max(0.05, min(0.95, 0.5 + (spot - s) / (spot * 0.05))), 3)
-
-        rows.append({
-            "strike_price": float(s),
-            "call_oi": base_c_oi, "call_change_oi": c_chg,
-            "call_ltp": c_ltp, "call_iv": c_iv, "call_delta": c_delta,
-            "call_volume": int(np.random.randint(10000, 400000)),
-            "put_oi": base_p_oi, "put_change_oi": p_chg,
-            "put_ltp": p_ltp, "put_iv": p_iv, "put_delta": round(c_delta - 1.0, 3),
-            "put_volume": int(np.random.randint(10000, 400000)),
-        })
-
-    df = pd.DataFrame(rows).sort_values("strike_price").reset_index(drop=True)
-    tc = int(df["call_oi"].sum()); tp = int(df["put_oi"].sum())
-    pcr = round(tp / max(1, tc), 3)
-    pcr_prev = round(pcr + np.random.uniform(-0.12, 0.12), 3)
-    pcr_shift = round(pcr - pcr_prev, 3)
+    df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+    tc = int(df["c_oi"].sum()); tp_ = int(df["p_oi"].sum())
+    pcr = round(tp_ / max(1, tc), 3)
+    pcr_prev = round(pcr + float(np.random.uniform(-0.12, 0.12)), 3)
 
     # Max Pain calculation
-    ss = df["strike_price"].values
-    co = df["call_oi"].values; po = df["put_oi"].values
+    ss = df["strike"].values
+    co = df["c_oi"].values; po = df["p_oi"].values
     S = ss[:, np.newaxis]; K = ss[np.newaxis, :]
     loss = (np.maximum(0, S - K) * co[np.newaxis, :] + np.maximum(0, K - S) * po[np.newaxis, :]).sum(axis=1)
-    max_pain = float(ss[np.argmin(loss)])
+    mp = float(ss[np.argmin(loss)])
 
-    atm_row = df.loc[(df["strike_price"] - atm_strike).abs().idxmin()]
-    active_range = df.iloc[max(0, len(df)//2 - 3): min(len(df), len(df)//2 + 4)]
-    call_unwind = bool((active_range["call_change_oi"] < -5000).any())
-    put_unwind = bool((active_range["put_change_oi"] < -5000).any())
-    call_writing = bool((active_range["call_change_oi"] > 15000).any())
-    put_writing = bool((active_range["put_change_oi"] > 15000).any())
-    simultaneous = call_writing and put_writing and abs(pcr - 1.0) < 0.15
+    atm_row = df.loc[(df["strike"] - atm).abs().idxmin()]
+    active = df.iloc[max(0, len(df)//2-3):min(len(df), len(df)//2+4)]
+    cu = bool((active["c_chg"] < -5000).any())
+    pu = bool((active["p_chg"] < -5000).any())
+    cw = bool((active["c_chg"] > 15000).any())
+    pw = bool((active["p_chg"] > 15000).any())
+    simw = cw and pw and abs(pcr - 1.0) < 0.15
 
-    return OptionChainSnapshot(
-        symbol=symbol, spot=spot, day_high=day_high, day_low=day_low, vix=vix,
-        atm_strike=atm_strike, max_pain=max_pain,
-        total_call_oi=tc, total_put_oi=tp, pcr=pcr, pcr_prev=pcr_prev, pcr_shift=pcr_shift,
-        atm_ce_ltp=float(atm_row["call_ltp"]), atm_pe_ltp=float(atm_row["put_ltp"]),
-        atm_ce_iv=float(atm_row["call_iv"]), atm_pe_iv=float(atm_row["put_iv"]),
-        atm_ce_delta=float(atm_row["call_delta"]), atm_pe_delta=float(atm_row["put_delta"]),
-        call_unwinding=call_unwind, put_unwinding=put_unwind,
-        call_writing=call_writing, put_writing=put_writing, simultaneous_writing=simultaneous,
-        df_chain=df, expiry_date="2026-09-04", market_open=market_open,
-    )
+    return {
+        "symbol": symbol, "spot": spot, "day_high": day_high, "day_low": day_low,
+        "vix": vix, "atm": atm, "max_pain": mp,
+        "total_c_oi": tc, "total_p_oi": tp_, "pcr": pcr, "pcr_prev": pcr_prev,
+        "pcr_shift": round(pcr - pcr_prev, 3),
+        "atm_c_ltp": float(atm_row["c_ltp"]), "atm_p_ltp": float(atm_row["p_ltp"]),
+        "atm_c_iv": float(atm_row["c_iv"]), "atm_p_iv": float(atm_row["p_iv"]),
+        "atm_c_delta": float(atm_row["c_delta"]), "atm_p_delta": float(atm_row["p_delta"]),
+        "call_unwind": cu, "put_unwind": pu,
+        "call_write": cw, "put_write": pw, "simul_write": simw,
+        "chain": df.to_dict("records"), "expiry": "2026-09-04",
+        "market_open": market_open,
+    }
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 2: NEWS SENTIMENT ENGINE (FinBERT + Lexicon)                    ║
+# ║  MODULE 2: 5-MIN OHLCV & TECHNICAL ENGINE                               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-@st.cache_resource(show_spinner=False)
-def _load_finbert():
+_candle_store: Dict[str, List[dict]] = {}
+
+def get_candles(symbol: str, spot: float, max_bars: int = 78) -> List[dict]:
+    market_open = is_nse_market_open()
+    if symbol not in _candle_store or len(_candle_store[symbol]) == 0 or not market_open:
+        np.random.seed(2000 + hash(symbol) % 10000)
+        bars = []
+        p = spot - float(np.random.uniform(20, 80))
+        t0 = math.floor(time.time() - max_bars * 300)
+        for i in range(max_bars):
+            ret = float(np.random.normal(0.0001, 0.0015))
+            c = round(p * (1 + ret), 2)
+            h = round(max(p, c) * (1 + abs(float(np.random.normal(0, 0.001)))), 2)
+            l = round(min(p, c) * (1 - abs(float(np.random.normal(0, 0.001)))), 2)
+            v = int(np.random.randint(12000, 55000))
+            bars.append({"time": t0 + i * 300, "open": p, "high": h, "low": l, "close": c, "volume": v})
+            p = c
+        _candle_store[symbol] = bars
+    else:
+        bars = _candle_store[symbol]
+        last = bars[-1]
+        now_t = math.floor(time.time())
+        if now_t - last["time"] < 300:
+            last["close"] = spot
+            last["high"] = max(last["high"], spot)
+            last["low"] = min(last["low"], spot)
+        else:
+            nb = {"time": last["time"] + 300, "open": last["close"],
+                  "high": max(last["close"], spot), "low": min(last["close"], spot),
+                  "close": spot, "volume": int(np.random.randint(12000, 55000))}
+            bars.append(nb)
+            if len(bars) > max_bars:
+                bars.pop(0)
+        _candle_store[symbol] = bars
+
+    return _candle_store[symbol]
+
+
+def compute_technicals(candles: List[dict]) -> dict:
+    df = pd.DataFrame(candles)
+    if len(df) < 5:
+        return {"close": 0, "vwap": 0, "vwap_slope": 0, "supertrend": 0, "st_dir": 1,
+                "ema9": 0, "ema21": 0, "ema_cross": "NEUTRAL", "adx": 0,
+                "plus_di": 0, "minus_di": 0, "rsi": 50, "vol_expanding": False, "pa_score": 0}
+
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].cumsum()
+    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
+    loss_s = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss_s.replace(0, np.nan)
+    df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
+
+    # Supertrend
+    h, l, c_ = df["high"].values, df["low"].values, df["close"].values
+    n = len(df); per = 10; mul = 3.0
+    tr = np.zeros(n); tr[0] = h[0] - l[0]
+    for i in range(1, n):
+        tr[i] = max(h[i]-l[i], abs(h[i]-c_[i-1]), abs(l[i]-c_[i-1]))
+    atr = pd.Series(tr).ewm(alpha=1/per, adjust=False).mean().values
+    hl2 = (h + l) / 2
+    bu, bl_ = hl2 + mul*atr, hl2 - mul*atr
+    fu, fl_ = np.copy(bu), np.copy(bl_)
+    d_ = np.zeros(n, dtype=int); sv = np.zeros(n)
+    d_[0] = 1 if c_[0] >= hl2[0] else -1
+    sv[0] = fl_[0] if d_[0] == 1 else fu[0]
+    for i in range(1, n):
+        fu[i] = bu[i] if bu[i] < fu[i-1] or c_[i-1] > fu[i-1] else fu[i-1]
+        fl_[i] = bl_[i] if bl_[i] > fl_[i-1] or c_[i-1] < fl_[i-1] else fl_[i-1]
+        if d_[i-1] == 1: d_[i], sv[i] = (-1, fu[i]) if c_[i] < fl_[i] else (1, fl_[i])
+        else: d_[i], sv[i] = (1, fl_[i]) if c_[i] > fu[i] else (-1, fu[i])
+    df["supertrend"] = sv; df["st_dir"] = d_
+
+    # ADX
+    a14 = 1/14
+    tr2 = pd.concat([df["high"]-df["low"],(df["high"]-df["close"].shift(1)).abs(),
+                      (df["low"]-df["close"].shift(1)).abs()],axis=1).max(axis=1)
+    up = df["high"] - df["high"].shift(1); dn = df["low"].shift(1) - df["low"]
+    pdm = np.where((up > dn) & (up > 0), up, 0.0)
+    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    atr2 = tr2.ewm(alpha=a14, adjust=False).mean()
+    spdm = pd.Series(pdm, index=df.index).ewm(alpha=a14, adjust=False).mean()
+    smdm = pd.Series(mdm, index=df.index).ewm(alpha=a14, adjust=False).mean()
+    pdi = (100 * spdm / atr2.replace(0, np.nan)).fillna(0)
+    mdi = (100 * smdm / atr2.replace(0, np.nan)).fillna(0)
+    dx = (100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)).fillna(0)
+    adx = dx.ewm(alpha=a14, adjust=False).mean().fillna(0)
+
+    df["vol_ema20"] = df["volume"].ewm(span=20, adjust=False).mean()
+    last = df.iloc[-1]; prev = df.iloc[-2] if len(df) > 1 else last
+
+    e9, e21 = float(last["ema9"]), float(last["ema21"])
+    pe9, pe21 = float(prev["ema9"]), float(prev["ema21"])
+    if e9 > e21 and pe9 <= pe21: ec = "BULLISH_CROSS"
+    elif e9 < e21 and pe9 >= pe21: ec = "BEARISH_CROSS"
+    elif e9 > e21: ec = "BULLISH_TREND"
+    else: ec = "BEARISH_TREND"
+
+    cl = float(last["close"]); vw = float(last["vwap"])
+    vr = df["vwap"].iloc[-5:].values
+    vs = float((vr[-1] - vr[0]) / max(1, vr[0]) * 10000) if len(vr) >= 2 else 0.0
+    vd = float(np.clip((cl - vw) / vw * 500, -1, 1))
+    sts = 0.5 if int(last["st_dir"]) == 1 else -0.5
+    es = 0.3 if e9 > e21 else -0.3
+    if ec in ("BULLISH_CROSS", "BEARISH_CROSS"): es *= 1.5
+    pa = float(np.clip(vd * 0.4 + sts * 0.35 + es * 0.25, -1, 1))
+
+    # Overlays array for chart
+    vwap_arr = [{"time": candles[i]["time"], "value": round(float(df["vwap"].iloc[i]), 2)} for i in range(len(df))]
+    ema9_arr = [{"time": candles[i]["time"], "value": round(float(df["ema9"].iloc[i]), 2)} for i in range(len(df))]
+    ema21_arr = [{"time": candles[i]["time"], "value": round(float(df["ema21"].iloc[i]), 2)} for i in range(len(df))]
+    st_arr = [{"time": candles[i]["time"], "value": round(float(df["supertrend"].iloc[i]), 2)} for i in range(len(df))]
+    vol_arr = [{"time": candles[i]["time"], "value": int(df["volume"].iloc[i]),
+                "color": "rgba(0,230,118,0.5)" if float(df["close"].iloc[i]) >= float(df["open"].iloc[i]) else "rgba(255,61,113,0.5)"}
+               for i in range(len(df))]
+    volavg_arr = [{"time": candles[i]["time"], "value": round(float(df["vol_ema20"].iloc[i]), 0)} for i in range(len(df))]
+
+    return {
+        "close": round(cl, 2), "vwap": round(vw, 2), "vwap_slope": round(vs, 2),
+        "supertrend": round(float(last["supertrend"]), 2),
+        "st_dir": int(last["st_dir"]),
+        "ema9": round(e9, 2), "ema21": round(e21, 2), "ema_cross": ec,
+        "adx": round(float(adx.iloc[-1]), 1),
+        "plus_di": round(float(pdi.iloc[-1]), 1),
+        "minus_di": round(float(mdi.iloc[-1]), 1),
+        "rsi": round(float(last["rsi"]), 1),
+        "vol_expanding": bool(int(last["volume"]) > float(last["vol_ema20"]) * 1.2),
+        "pa_score": round(pa, 4),
+        "vwap_line": vwap_arr, "ema9_line": ema9_arr, "ema21_line": ema21_arr,
+        "st_line": st_arr, "vol_hist": vol_arr, "vol_avg_line": volavg_arr,
+    }
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  MODULE 3: NEWS SENTIMENT ENGINE                                         ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+_finbert = None
+
+def _get_finbert():
+    global _finbert
+    if _finbert is not None:
+        return _finbert
     try:
         from transformers import pipeline as hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer
         name = "ProsusAI/finbert"
         tok = AutoTokenizer.from_pretrained(name)
         mdl = AutoModelForSequenceClassification.from_pretrained(name)
-        return hf_pipeline("sentiment-analysis", model=mdl, tokenizer=tok, device=-1, top_k=None, truncation=True, max_length=512)
+        _finbert = hf_pipeline("sentiment-analysis", model=mdl, tokenizer=tok, device=-1, top_k=None, truncation=True, max_length=512)
+        return _finbert
     except Exception:
         return None
 
-def _score_headline_lexicon(text: str) -> float:
-    lower = text.lower()
-    pos = sum(1 for w in BULL_LEXICON if w in lower)
-    neg = sum(1 for w in BEAR_LEXICON if w in lower)
-    if pos > neg: return min(1.0, 0.3 + 0.15 * (pos - neg))
-    elif neg > pos: return max(-1.0, -0.3 - 0.15 * (neg - pos))
+def _lex_score(text: str) -> float:
+    lo = text.lower()
+    p = sum(1 for w in BULL_LEX if w in lo)
+    n = sum(1 for w in BEAR_LEX if w in lo)
+    if p > n: return min(1.0, 0.3 + 0.15 * (p - n))
+    elif n > p: return max(-1.0, -0.3 - 0.15 * (n - p))
     return 0.0
 
-@st.cache_data(ttl=15, show_spinner=False)
-def fetch_and_score_sentiment() -> Tuple[float, int, List[Dict[str, Any]]]:
-    nlp = _load_finbert()
-    headlines_data: List[Dict[str, Any]] = []
-    seen = set()
-
-    if _HAS_FEEDPARSER:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        for source, url in RSS_FEEDS.items():
+def fetch_sentiment() -> Tuple[float, List[dict]]:
+    nlp = _get_finbert()
+    items: List[dict] = []; seen: Set[str] = set()
+    if _HAS_FP:
+        for src, url in RSS_FEEDS.items():
             try:
-                resp = requests.get(url, headers=headers, timeout=6)
-                if resp.status_code != 200: continue
-                feed = feedparser.parse(resp.content)
-                for entry in feed.entries[:5]:
-                    title = re.sub(r"<.*?>", "", getattr(entry, "title", "")).strip()
-                    title = re.sub(r"&[a-zA-Z]+;", " ", title).strip()
-                    if not title or title.lower() in seen: continue
-                    seen.add(title.lower())
+                r = http_req.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+                if r.status_code != 200: continue
+                for e in feedparser.parse(r.content).entries[:5]:
+                    t = re.sub(r"<.*?>", "", getattr(e, "title", "")).strip()
+                    t = re.sub(r"&[a-zA-Z]+;", " ", t).strip()
+                    if not t or t.lower() in seen: continue
+                    seen.add(t.lower())
                     if nlp:
                         try:
-                            res = nlp(title)
-                            scores = {r["label"].lower(): r["score"] for r in res[0]}
-                            score = float(np.clip(scores.get("positive", 0) - scores.get("negative", 0), -1, 1))
-                        except Exception: score = _score_headline_lexicon(title)
-                    else: score = _score_headline_lexicon(title)
-                    headlines_data.append({"source": source, "title": title, "polarity": round(score, 3)})
-            except Exception: pass
+                            res = nlp(t)
+                            sc = {r_["label"].lower(): r_["score"] for r_ in res[0]}
+                            s = float(np.clip(sc.get("positive",0)-sc.get("negative",0),-1,1))
+                        except: s = _lex_score(t)
+                    else:
+                        s = _lex_score(t)
+                    items.append({"source": src, "title": t, "score": round(s, 3)})
+            except: pass
 
-    if not headlines_data:
-        for title, score in [
-            ("Nifty surges past 24,500 led by IT and Banking rally", 0.72),
-            ("FII inflows continue for 5th consecutive session", 0.55),
-            ("RBI holds repo rate, inflation within target band", 0.30),
-            ("Global markets cautious ahead of Fed meeting", -0.18),
-            ("India GDP growth beats estimates at 7.2%", 0.65),
-        ]:
-            headlines_data.append({"source": "Synthetic", "title": title, "polarity": score})
+    if not items:
+        for t, s in [("Nifty surges past 24,500 led by IT and Banking rally", 0.72),
+                      ("FII inflows continue for 5th consecutive session", 0.55),
+                      ("RBI holds repo rate, inflation within target band", 0.30),
+                      ("Global markets cautious ahead of Fed meeting", -0.18),
+                      ("India GDP growth beats estimates at 7.2%", 0.65)]:
+            items.append({"source": "Synthetic", "title": t, "score": s})
 
-    polarities = [h["polarity"] for h in headlines_data]
-    agg = float(np.clip(np.mean(polarities), -1, 1)) if polarities else 0.0
-    return round(agg, 4), len(headlines_data), headlines_data
-
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 3: TECHNICAL & MOMENTUM ENGINE (5-Min OHLCV)                   ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-def generate_5min_ohlcv(symbol: str, base_price: float, bars: int = 78) -> pd.DataFrame:
-    market_open = is_nse_market_open()
-    if "candle_buffers" not in st.session_state:
-        st.session_state.candle_buffers = {}
-
-    if not market_open or symbol not in st.session_state.candle_buffers:
-        seed = 2000 + hash(symbol) % 10000 if not market_open else int(time.time() // 15) + hash(symbol) % 10000
-        np.random.seed(seed)
-
-        phase_len = bars // 3
-        trend1 = np.random.normal(0.0003, 0.0015, phase_len)
-        trend2 = np.random.normal(-0.0001, 0.0020, phase_len)
-        trend3 = np.random.normal(0.0002, 0.0012, bars - 2 * phase_len)
-        returns = np.concatenate([trend1, trend2, trend3])
-
-        closes = base_price * np.cumprod(1 + returns)
-        highs = closes * (1 + np.abs(np.random.normal(0, 0.0012, bars)))
-        lows = closes * (1 - np.abs(np.random.normal(0, 0.0012, bars)))
-        opens = np.roll(closes, 1); opens[0] = base_price
-
-        vol_base = np.random.randint(8000, 45000, bars).astype(float)
-        volumes = vol_base.astype(int)
-        now = pd.Timestamp.now().normalize() + pd.Timedelta(hours=9, minutes=15)
-        timestamps = pd.date_range(now, periods=bars, freq="5min")
-
-        df = pd.DataFrame({"timestamp": timestamps, "open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes})
-        st.session_state.candle_buffers[symbol] = df
-    else:
-        df = st.session_state.candle_buffers[symbol].copy()
-        last_idx = len(df) - 1
-        df.loc[last_idx, "close"] = base_price
-        df.loc[last_idx, "high"] = max(df.loc[last_idx, "high"], base_price)
-        df.loc[last_idx, "low"] = min(df.loc[last_idx, "low"], base_price)
-        st.session_state.candle_buffers[symbol] = df
-
-    return st.session_state.candle_buffers[symbol]
-
-
-@dataclass
-class TechnicalState:
-    close: float
-    vwap: float
-    vwap_slope: float
-    supertrend: float
-    supertrend_dir: int
-    ema_9: float
-    ema_21: float
-    ema_crossover: str
-    adx: float
-    plus_di: float
-    minus_di: float
-    rsi: float
-    vol_avg_20: float
-    vol_latest: int
-    vol_expanding: bool
-    price_action_score: float
-
-
-@st.cache_data(ttl=15, show_spinner=False)
-def compute_technicals(df: pd.DataFrame) -> Tuple[pd.DataFrame, TechnicalState]:
-    d = df.copy()
-    tp = (d["high"] + d["low"] + d["close"]) / 3
-    d["vwap"] = (tp * d["volume"]).cumsum() / d["volume"].cumsum()
-    d["ema_9"] = d["close"].ewm(span=9, adjust=False).mean()
-    d["ema_21"] = d["close"].ewm(span=21, adjust=False).mean()
-
-    delta = d["close"].diff()
-    gain = delta.where(delta > 0, 0.0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    d["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
-
-    # Supertrend
-    h, l, c = d["high"].values, d["low"].values, d["close"].values
-    n = len(d); period = 10; multiplier = 3.0
-    tr = np.zeros(n); tr[0] = h[0] - l[0]
-    for i in range(1, n):
-        tr[i] = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
-    atr = pd.Series(tr).ewm(alpha=1/period, adjust=False).mean().values
-    hl2 = (h + l) / 2
-    bu, bl = hl2 + multiplier * atr, hl2 - multiplier * atr
-    fu, fl = np.copy(bu), np.copy(bl)
-    st_val, st_dir = np.zeros(n), np.zeros(n, dtype=int)
-    st_dir[0] = 1 if c[0] >= hl2[0] else -1
-    st_val[0] = fl[0] if st_dir[0] == 1 else fu[0]
-    for i in range(1, n):
-        fu[i] = bu[i] if bu[i] < fu[i-1] or c[i-1] > fu[i-1] else fu[i-1]
-        fl[i] = bl[i] if bl[i] > fl[i-1] or c[i-1] < fl[i-1] else fl[i-1]
-        if st_dir[i-1] == 1:
-            st_dir[i], st_val[i] = (-1, fu[i]) if c[i] < fl[i] else (1, fl[i])
-        else:
-            st_dir[i], st_val[i] = (1, fl[i]) if c[i] > fu[i] else (-1, fu[i])
-    d["supertrend"] = st_val; d["supertrend_dir"] = st_dir
-
-    # ADX
-    a14 = 1/14
-    tr2 = pd.concat([d["high"]-d["low"],(d["high"]-d["close"].shift(1)).abs(),(d["low"]-d["close"].shift(1)).abs()],axis=1).max(axis=1)
-    up = d["high"] - d["high"].shift(1); dn = d["low"].shift(1) - d["low"]
-    pdm = np.where((up > dn) & (up > 0), up, 0.0)
-    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    atr2 = tr2.ewm(alpha=a14, adjust=False).mean()
-    spdm = pd.Series(pdm, index=d.index).ewm(alpha=a14, adjust=False).mean()
-    smdm = pd.Series(mdm, index=d.index).ewm(alpha=a14, adjust=False).mean()
-    pdi = (100 * spdm / atr2.replace(0, np.nan)).fillna(0)
-    mdi = (100 * smdm / atr2.replace(0, np.nan)).fillna(0)
-    dx = (100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)).fillna(0)
-    adx = dx.ewm(alpha=a14, adjust=False).mean().fillna(0)
-    d["adx"] = adx
-
-    d["vol_ema_20"] = d["volume"].ewm(span=20, adjust=False).mean()
-    last = d.iloc[-1]; prev = d.iloc[-2] if len(d) > 1 else last
-
-    e9, e21 = float(last["ema_9"]), float(last["ema_21"])
-    pe9, pe21 = float(prev["ema_9"]), float(prev["ema_21"])
-    if e9 > e21 and pe9 <= pe21: ema_cross = "BULLISH_CROSS"
-    elif e9 < e21 and pe9 >= pe21: ema_cross = "BEARISH_CROSS"
-    elif e9 > e21: ema_cross = "BULLISH_TREND"
-    else: ema_cross = "BEARISH_TREND"
-
-    close = float(last["close"]); vwap_val = float(last["vwap"])
-    vr = d["vwap"].iloc[-5:].values
-    vwap_slope = float((vr[-1] - vr[0]) / max(1, vr[0]) * 10000) if len(vr) >= 2 else 0.0
-    vwap_diff = np.clip((close - vwap_val) / vwap_val * 500, -1, 1)
-    st_score = 0.5 if int(last["supertrend_dir"]) == 1 else -0.5
-    ema_score = 0.3 if e9 > e21 else -0.3
-    if ema_cross in ("BULLISH_CROSS", "BEARISH_CROSS"): ema_score *= 1.5
-    pa_score = float(np.clip(vwap_diff * 0.4 + st_score * 0.35 + ema_score * 0.25, -1, 1))
-
-    return d, TechnicalState(
-        close=close, vwap=round(vwap_val, 2), vwap_slope=round(vwap_slope, 2),
-        supertrend=round(float(last["supertrend"]), 2), supertrend_dir=int(last["supertrend_dir"]),
-        ema_9=round(e9, 2), ema_21=round(e21, 2), ema_crossover=ema_cross,
-        adx=round(float(adx.iloc[-1]), 1), plus_di=round(float(pdi.iloc[-1]), 1), minus_di=round(float(mdi.iloc[-1]), 1),
-        rsi=round(float(last["rsi"]), 1), vol_avg_20=round(float(last["vol_ema_20"]), 0), vol_latest=int(last["volume"]),
-        vol_expanding=bool(int(last["volume"]) > float(last["vol_ema_20"]) * 1.2), price_action_score=round(pa_score, 4),
-    )
+    agg = round(float(np.mean([i["score"] for i in items])), 4) if items else 0.0
+    return agg, items
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  MODULE 4: MULTI-AGENT AI CONSENSUS DECISION BRAIN                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-@dataclass
-class PredictionResult:
-    signal: Literal["BUY_ATM_CE", "BUY_ATM_PE", "NO_TRADE"]
-    regime: str
-    strategy_name: str
-    confidence: float
-    conviction_level: str
-    score_price_action: float
-    score_option_flow: float
-    score_sentiment: float
-    score_greeks_vol: float
-    pa_pts: float
-    of_pts: float
-    se_pts: float
-    gv_pts: float
-    pa_label: str
-    oi_label: str
-    trap_status: str
-    strike: float
-    option_type: str
-    entry_premium: float
-    stop_loss: float
-    target: float
-    risk_pts: float
-    reward_pts: float
-    delta_selected: float
-    reason: str
-    trap_warning: str
-
-
-def run_prediction_engine(chain: OptionChainSnapshot, tech: TechnicalState, sentiment_score: float) -> PredictionResult:
-    adx = tech.adx; rsi = tech.rsi; pcr = chain.pcr
-    vol_exp = tech.vol_expanding; simul_write = chain.simultaneous_writing
-    iv_mid = (chain.atm_ce_iv + chain.atm_pe_iv) / 2
+def predict(chain: dict, tech: dict, sent: float) -> dict:
+    adx = tech["adx"]; rsi = tech["rsi"]; pcr = chain["pcr"]
+    vol_exp = tech["vol_expanding"]; simw = chain["simul_write"]
+    iv_mid = (chain["atm_c_iv"] + chain["atm_p_iv"]) / 2
     iv_crush = iv_mid < 11.0
 
-    if adx >= 22 and vol_exp: regime, strategy = "STRONG_TREND", "Momentum Breakout"
-    elif adx < 22 and (pcr > 1.25 or pcr < 0.75 or rsi > 72 or rsi < 28): regime, strategy = "MEAN_REVERSION", "Support-Resistance Bounce"
-    elif adx < 18 and simul_write and iv_crush: regime, strategy = "CHOP_TRAP", "Capital Protection"
-    elif adx < 22: regime, strategy = "RANGE_BOUND", "Wait & Watch"
-    else: regime, strategy = "TRANSITIONAL", "Selective Momentum"
+    # Regime Classification
+    if adx >= 22 and vol_exp:
+        regime, strat = "STRONG_TREND", "Momentum Breakout"
+    elif adx < 22 and (pcr > 1.25 or pcr < 0.75 or rsi > 72 or rsi < 28):
+        regime, strat = "MEAN_REVERSION", "Support-Resistance Bounce"
+    elif adx < 18 and simw and iv_crush:
+        regime, strat = "CHOP_TRAP", "Capital Protection"
+    elif adx < 22:
+        regime, strat = "RANGE_BOUND", "Wait & Watch"
+    else:
+        regime, strat = "TRANSITIONAL", "Selective Momentum"
 
-    # Multi-Agent Factor Point Breakdown (Out of 100%)
-    pa_raw = tech.price_action_score
-    st_b = 8 if tech.supertrend_dir == (1 if pa_raw > 0 else -1) else -5
-    ema_b = 10 if tech.ema_crossover in ("BULLISH_CROSS", "BEARISH_CROSS") else 0
-    pa_100 = np.clip(50 + pa_raw * 40 + st_b + ema_b, 0, 100)
-    pa_pts = round(float(pa_100 * 0.35), 1)
+    # Multi-Agent Factor Scores with Exact Points Breakdown
+    pa_raw = tech["pa_score"]
+    st_b = 8 if tech["st_dir"] == (1 if pa_raw > 0 else -1) else -5
+    ema_b = 10 if tech["ema_cross"] in ("BULLISH_CROSS", "BEARISH_CROSS") else 0
+    pa_score_100 = np.clip(50 + pa_raw * 40 + st_b + ema_b, 0, 100)
+    pa_pts = round(float(pa_score_100 * 0.35), 1)
 
     pcr_sig = min(30, (pcr - 1.10) * 100) if pcr > 1.10 else (max(-30, (pcr - 0.85) * 100) if pcr < 0.85 else 0)
     oi_sig = 0
-    if chain.call_unwinding and not chain.put_unwinding: oi_sig = 20
-    elif chain.put_unwinding and not chain.call_unwinding: oi_sig = -20
-    elif chain.put_writing and not chain.call_writing: oi_sig = 15
-    elif chain.call_writing and not chain.put_writing: oi_sig = -15
-    of_100 = np.clip(50 + np.clip(pcr_sig + oi_sig + chain.pcr_shift * 50, -50, 50), 0, 100)
-    of_pts = round(float(of_100 * 0.35), 1)
+    if chain["call_unwind"] and not chain["put_unwind"]: oi_sig = 20
+    elif chain["put_unwind"] and not chain["call_unwind"]: oi_sig = -20
+    elif chain["put_write"] and not chain["call_write"]: oi_sig = 15
+    elif chain["call_write"] and not chain["put_write"]: oi_sig = -15
+    of_score_100 = np.clip(50 + np.clip(pcr_sig + oi_sig + chain["pcr_shift"] * 50, -50, 50), 0, 100)
+    of_pts = round(float(of_score_100 * 0.35), 1)
 
-    se_100 = np.clip(50 + sentiment_score * 45, 0, 100)
-    se_pts = round(float(se_100 * 0.15), 1)
+    se_score_100 = np.clip(50 + sent * 45, 0, 100)
+    se_pts = round(float(se_score_100 * 0.15), 1)
 
     iv_pen = -min(15, (iv_mid - 18) * 2) if iv_mid > 18 else (-10 if iv_mid < 9 else 0)
-    atm_delta = max(abs(chain.atm_ce_delta), abs(chain.atm_pe_delta))
-    d_bon = 10 if 0.42 <= atm_delta <= 0.58 else 0
-    gv_100 = np.clip(55 + iv_pen + d_bon + (chain.vix - 14) * -2, 0, 100)
-    gv_pts = round(float(gv_100 * 0.15), 1)
+    ad = max(abs(chain["atm_c_delta"]), abs(chain["atm_p_delta"]))
+    d_bon = 10 if 0.42 <= ad <= 0.58 else 0
+    gv_score_100 = np.clip(55 + iv_pen + d_bon + (chain["vix"] - 14) * -2, 0, 100)
+    gv_pts = round(float(gv_score_100 * 0.15), 1)
 
-    bullish_conf = pa_pts + of_pts + se_pts + gv_pts
-    bearish_conf = (35 - pa_pts) + (35 - of_pts) + (15 - se_pts) + gv_pts
+    bull = pa_pts + of_pts + se_pts + gv_pts
+    bear = (35 - pa_pts) + (35 - of_pts) + (15 - se_pts) + gv_pts
 
     if regime == "STRONG_TREND":
-        if tech.supertrend_dir == 1: bullish_conf += 5
-        else: bearish_conf += 5
+        if tech["st_dir"] == 1: bull += 5
+        else: bear += 5
     elif regime == "MEAN_REVERSION":
-        if rsi < 30: bullish_conf += 4
-        elif rsi > 70: bearish_conf += 4
+        if rsi < 30: bull += 4
+        elif rsi > 70: bear += 4
 
-    bullish_conf = round(float(np.clip(bullish_conf, 0, 100)), 1)
-    bearish_conf = round(float(np.clip(bearish_conf, 0, 100)), 1)
+    bull_conf = round(float(np.clip(bull, 0, 100)), 1)
+    bear_conf = round(float(np.clip(bear, 0, 100)), 1)
 
-    trap_warning = ""; force_no_trade = False
+    trap_msg = ""; force_nt = False
     if regime == "CHOP_TRAP":
-        trap_warning = "⚠️ CHOP TRAP: Simultaneous writing + low ADX + crushed IV."
-        force_no_trade = True
-    elif simul_write and adx < 20:
-        trap_warning = "⚠️ Range-bound balanced writing. Breakout direction uncertain."
-        bullish_conf = round(bullish_conf * 0.8, 1)
-        bearish_conf = round(bearish_conf * 0.8, 1)
+        trap_msg = "CHOP TRAP: Simultaneous Writing + Low ADX + Crushing IV."
+        force_nt = True
+    elif simw and adx < 20:
+        trap_msg = "Range-bound balanced writing. Breakout direction uncertain."
+        bull_conf = round(bull_conf * 0.8, 1)
+        bear_conf = round(bear_conf * 0.8, 1)
 
-    # Decision Threshold: >= 75%
-    if force_no_trade or (bullish_conf < 75 and bearish_conf < 75):
-        signal = "NO_TRADE"; confidence = max(bullish_conf, bearish_conf)
-    elif bullish_conf >= 75 and bullish_conf > bearish_conf:
-        signal = "BUY_ATM_CE"; confidence = bullish_conf
-    elif bearish_conf >= 75:
-        signal = "BUY_ATM_PE"; confidence = bearish_conf
+    if force_nt or (bull_conf < 75 and bear_conf < 75):
+        sig, conf = "NO_TRADE", max(bull_conf, bear_conf)
+    elif bull_conf >= 75 and bull_conf > bear_conf:
+        sig, conf = "BUY_ATM_CE", bull_conf
+    elif bear_conf >= 75:
+        sig, conf = "BUY_ATM_PE", bear_conf
     else:
-        signal = "NO_TRADE"; confidence = max(bullish_conf, bearish_conf)
+        sig, conf = "NO_TRADE", max(bull_conf, bear_conf)
 
-    conviction = "VERY HIGH" if confidence >= 85 else ("HIGH" if confidence >= 75 else ("MEDIUM" if confidence >= 65 else "LOW"))
+    conv = "VERY HIGH" if conf >= 85 else ("HIGH" if conf >= 75 else ("MEDIUM" if conf >= 65 else "LOW"))
 
-    if signal == "BUY_ATM_CE":
-        entry = max(5.0, chain.atm_ce_ltp); delta_sel = chain.atm_ce_delta; opt_type = "CE"
-    elif signal == "BUY_ATM_PE":
-        entry = max(5.0, chain.atm_pe_ltp); delta_sel = abs(chain.atm_pe_delta); opt_type = "PE"
+    if sig == "BUY_ATM_CE":
+        entry = max(5.0, chain["atm_c_ltp"]); delta = chain["atm_c_delta"]; ot = "CE"
+    elif sig == "BUY_ATM_PE":
+        entry = max(5.0, chain["atm_p_ltp"]); delta = abs(chain["atm_p_delta"]); ot = "PE"
     else:
-        entry, delta_sel, opt_type = 0.0, 0.0, "NONE"
+        entry, delta, ot = 0, 0, "NONE"
 
-    sl = round(entry * 0.88, 2) if entry > 0 else 0.0   # 12% Stop Loss
-    tgt = round(entry * 1.24, 2) if entry > 0 else 0.0  # 24% Target (1:2 R:R)
-    risk_pts = round(entry - sl, 2) if entry > 0 else 0.0
-    reward_pts = round(tgt - entry, 2) if entry > 0 else 0.0
+    sl = round(entry * 0.88, 2) if entry > 0 else 0   # 12% Stop Loss
+    tgt = round(entry * 1.24, 2) if entry > 0 else 0  # 24% Target (1:2 R:R)
 
-    trap_status = "PASSED" if not trap_warning else ("BLOCKED" if force_no_trade else "WARNING")
-    pa_label = "Bullish" if pa_100 >= 60 else ("Bearish" if pa_100 <= 40 else "Neutral")
-    if chain.call_unwinding: oi_label = "Call Unwind"
-    elif chain.put_writing: oi_label = "Put Writing"
-    elif chain.call_writing: oi_label = "Call Writing"
-    elif chain.put_unwinding: oi_label = "Put Unwind"
+    trap_status = "PASSED" if not trap_msg else ("BLOCKED" if force_nt else "WARNING")
+    pa_label = "Bullish" if pa_score_100 >= 60 else ("Bearish" if pa_score_100 <= 40 else "Neutral")
+
+    if chain["call_unwind"]: oi_label = "Call Unwind"
+    elif chain["put_write"]: oi_label = "Put Writing"
+    elif chain["call_write"]: oi_label = "Call Writing"
+    elif chain["put_unwind"]: oi_label = "Put Unwind"
     else: oi_label = "Balanced"
 
-    reason = f"{signal}: {strategy} regime. ADX={adx:.1f}, PCR={pcr:.2f}, RSI={rsi:.0f}. Confidence={confidence:.1f}%."
-
-    return PredictionResult(
-        signal=signal, regime=regime, strategy_name=strategy,
-        confidence=confidence, conviction_level=conviction,
-        score_price_action=round(pa_100, 1), score_option_flow=round(of_100, 1),
-        score_sentiment=round(se_100, 1), score_greeks_vol=round(gv_100, 1),
-        pa_pts=pa_pts, of_pts=of_pts, se_pts=se_pts, gv_pts=gv_pts,
-        pa_label=pa_label, oi_label=oi_label, trap_status=trap_status,
-        strike=chain.atm_strike, option_type=opt_type,
-        entry_premium=entry, stop_loss=sl, target=tgt,
-        risk_pts=risk_pts, reward_pts=reward_pts, delta_selected=round(delta_sel, 3),
-        reason=reason, trap_warning=trap_warning,
-    )
+    return {
+        "signal": sig, "regime": regime, "strategy": strat,
+        "confidence": conf, "conviction": conv,
+        "pa_pts": pa_pts, "of_pts": of_pts, "se_pts": se_pts, "gv_pts": gv_pts,
+        "strike": chain["atm"], "option_type": ot,
+        "entry": round(entry, 2), "sl": sl, "target": tgt,
+        "delta": round(delta, 3),
+        "trap_warning": trap_msg, "trap_status": trap_status,
+        "pa_label": pa_label, "oi_label": oi_label,
+    }
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 5: INTERACTIVE PLOTLY CANDLESTICK CHART                         ║
+# ║  MODULE 5: FASTAPI WEBSOCKET ENDPOINTS                                  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-def build_candlestick_chart(df: pd.DataFrame, signal: str, tech: TechnicalState, entry_price: float = 0.0, target_price: float = 0.0, stop_loss: float = 0.0) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.72, 0.28])
+class ConnectionManager:
+    def __init__(self):
+        self.active: List[WebSocket] = []
 
-    fig.add_trace(go.Candlestick(
-        x=df["timestamp"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-        increasing=dict(line=dict(color="#00E676"), fillcolor="#00E676"),
-        decreasing=dict(line=dict(color="#FF3D71"), fillcolor="#FF3D71"),
-        name="Price", showlegend=False,
-    ), row=1, col=1)
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
 
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["vwap"], line=dict(color="#00E5FF", width=1.5, dash="dot"), name="VWAP"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["ema_9"], line=dict(color="#FFB300", width=1), name="EMA 9"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["ema_21"], line=dict(color="#E040FB", width=1), name="EMA 21"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["supertrend"], line=dict(color="#00E676" if tech.supertrend_dir == 1 else "#FF3D71", width=1.5), name="Supertrend"), row=1, col=1)
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
 
-    if signal in ("BUY_ATM_CE", "BUY_ATM_PE"):
-        marker_color = "#00E676" if signal == "BUY_ATM_CE" else "#FF3D71"
-        marker_symbol = "triangle-up" if signal == "BUY_ATM_CE" else "triangle-down"
-        y_pos = float(df.iloc[-1]["low"] * 0.999) if signal == "BUY_ATM_CE" else float(df.iloc[-1]["high"] * 1.001)
-        fig.add_trace(go.Scatter(
-            x=[df.iloc[-1]["timestamp"]], y=[y_pos], mode="markers",
-            marker=dict(symbol=marker_symbol, size=16, color=marker_color, line=dict(width=1, color="#FFF")),
-            name="ENTRY", showlegend=True,
-        ), row=1, col=1)
+mgr = ConnectionManager()
 
-    if signal in ("BUY_ATM_CE", "BUY_ATM_PE") and entry_price > 0:
-        fig.add_hline(y=entry_price, row=1, col=1, line_width=2, line_color="#FFD600", annotation_text=f"ENTRY @ ₹{entry_price:.1f}", annotation_position="top left", annotation_font=dict(size=10, color="#FFD600"))
-        fig.add_hline(y=target_price, row=1, col=1, line_width=1.5, line_dash="dash", line_color="#00E676", annotation_text=f"TARGET (1:2) @ ₹{target_price:.1f}", annotation_position="top left", annotation_font=dict(size=10, color="#00E676"))
-        fig.add_hline(y=stop_loss, row=1, col=1, line_width=1.5, line_dash="dash", line_color="#FF3D71", annotation_text=f"STOP-LOSS (12%) @ ₹{stop_loss:.1f}", annotation_position="bottom left", annotation_font=dict(size=10, color="#FF3D71"))
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML_TEMPLATE
 
-    colors = ["#00E676" if c >= o else "#FF3D71" for c, o in zip(df["close"], df["open"])]
-    fig.add_trace(go.Bar(x=df["timestamp"], y=df["volume"], marker_color=colors, opacity=0.6, name="Volume", showlegend=False), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["vol_ema_20"], line=dict(color="#FFB300", width=1), name="Vol EMA 20"), row=2, col=1)
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await mgr.connect(websocket)
+    sent_score, headlines = fetch_sentiment()
 
-    fig.update_layout(
-        uirevision=True, height=480, margin=dict(t=10, b=10, l=8, r=8),
-        paper_bgcolor="#07090e", plot_bgcolor="#07090e", font=dict(color="#94A3B8", size=10),
-        legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center", font=dict(size=9), bgcolor="rgba(0,0,0,0)"),
-        xaxis=dict(rangeslider=dict(visible=False), gridcolor="rgba(255,255,255,0.03)"),
-        xaxis2=dict(gridcolor="rgba(255,255,255,0.03)"),
-        yaxis=dict(gridcolor="rgba(255,255,255,0.05)", side="right"),
-        yaxis2=dict(gridcolor="rgba(255,255,255,0.05)", side="right"),
-    )
-    fig.update_xaxes(showticklabels=False, row=1, col=1)
-    return fig
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.01)
+                data = json.loads(msg)
+                if "symbol" in data:
+                    websocket._symbol = data["symbol"]
+            except asyncio.TimeoutError:
+                pass
 
+            symbol = getattr(websocket, "_symbol", "NIFTY")
 
-def build_pcr_gauge(pcr: float) -> go.Figure:
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=pcr, number={"font": {"size": 28, "color": "#FFF"}, "valueformat": ".2f"},
-        gauge={
-            "axis": {"range": [0.4, 1.8], "tickwidth": 1, "tickcolor": "#64748B", "tickfont": {"size": 9}},
-            "bar": {"color": "#00E5FF", "thickness": 0.25}, "bgcolor": "#111622", "borderwidth": 0,
-            "steps": [
-                {"range": [0.4, 0.85], "color": "rgba(255,61,113,0.25)"},
-                {"range": [0.85, 1.10], "color": "rgba(100,116,139,0.15)"},
-                {"range": [1.10, 1.8], "color": "rgba(0,230,118,0.25)"},
-            ],
-            "threshold": {"line": {"color": "#FFB300", "width": 3}, "thickness": 0.75, "value": pcr},
-        },
-    ))
-    fig.update_layout(uirevision=True, height=145, margin=dict(t=12, b=8, l=18, r=18), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#E2E8F0"))
-    return fig
+            chain = generate_chain(symbol)
+            candles = get_candles(symbol, chain["spot"])
+            tech = compute_technicals(candles)
+            pred = predict(chain, tech, sent_score)
 
-
-def build_oi_chart(df: pd.DataFrame, atm_strike: float) -> go.Figure:
-    strikes = df["strike_price"].tolist()
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="Call Chg OI", x=strikes, y=df["call_change_oi"], marker_color="#FF3D71", opacity=0.85))
-    fig.add_trace(go.Bar(name="Put Chg OI", x=strikes, y=df["put_change_oi"], marker_color="#00E676", opacity=0.85))
-    fig.add_vline(x=float(atm_strike), line_width=2, line_dash="dash", line_color="#00E5FF", annotation_text=f"ATM {int(atm_strike)}", annotation_position="top right", annotation_font=dict(size=9, color="#00E5FF"))
-    fig.update_layout(
-        uirevision=True, barmode="group", height=200, margin=dict(t=18, b=14, l=8, r=8),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", y=1.18, x=0.5, xanchor="center", font=dict(size=10, color="#94A3B8")),
-        xaxis=dict(tickmode="array", tickvals=strikes, ticktext=[str(int(s)) for s in strikes], tickfont=dict(size=8, color="#64748B"), gridcolor="rgba(255,255,255,0.03)"),
-        yaxis=dict(tickfont=dict(size=8, color="#64748B"), gridcolor="rgba(255,255,255,0.03)", zerolinecolor="rgba(255,255,255,0.12)"),
-    )
-    return fig
-
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 6: STREAMLIT DASHBOARD UI ENGINE                                ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-DARK_CSS = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
-
-[data-testid="stAppViewContainer"] {
-    background: #07090E;
-    color: #F0F4F8;
-    font-family: 'Inter', -apple-system, sans-serif;
-    font-variant-numeric: tabular-nums;
-}
-[data-testid="stHeader"] {
-    background: rgba(7,9,14,0.92);
-    backdrop-filter: blur(16px);
-}
-.block-container {
-    padding: 0.6rem 0.7rem 2rem !important;
-    max-width: 1050px !important;
-}
-.hero-card {
-    border-radius: 18px;
-    padding: 20px 18px;
-    margin-bottom: 14px;
-    position: relative;
-    overflow: hidden;
-    transition: all 0.4s ease;
-}
-.hero-ce {
-    background: linear-gradient(135deg, rgba(0,230,118,0.08) 0%, rgba(17,22,34,0.98) 100%);
-    border: 2px solid #00E676;
-    box-shadow: 0 0 35px rgba(0,230,118,0.2), inset 0 0 40px rgba(0,230,118,0.04);
-}
-.hero-pe {
-    background: linear-gradient(135deg, rgba(255,61,113,0.08) 0%, rgba(17,22,34,0.98) 100%);
-    border: 2px solid #FF3D71;
-    box-shadow: 0 0 35px rgba(255,61,113,0.2), inset 0 0 40px rgba(255,61,113,0.04);
-}
-.hero-nt {
-    background: #111622;
-    border: 1px solid #1E2638;
-}
-.hero-header { display: flex; justify-content: space-between; align-items: center; }
-.sym-big { font-size: 1.55rem; font-weight: 900; color: #FFF; margin: 0; }
-.badge { padding: 5px 14px; border-radius: 22px; font-weight: 800; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px; }
-.badge-ce { background: #00E676; color: #07090E; box-shadow: 0 0 14px #00E676; }
-.badge-pe { background: #FF3D71; color: #FFF; box-shadow: 0 0 14px #FF3D71; }
-.badge-nt { background: #1E2638; color: #64748B; }
-
-.certainty-ring {
-    width: 110px; height: 110px; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center; flex-direction: column;
-    margin: 12px auto 8px; position: relative;
-}
-.certainty-ring::before {
-    content: ''; position: absolute; inset: 0; border-radius: 50%; padding: 4px;
-    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-    mask-composite: exclude; -webkit-mask-composite: xor;
-}
-.ring-ce::before { background: conic-gradient(#00E676 var(--pct), #182030 0); }
-.ring-pe::before { background: conic-gradient(#FF3D71 var(--pct), #182030 0); }
-.ring-nt::before { background: conic-gradient(#64748B var(--pct), #182030 0); }
-.cert-pct { font-size: 1.6rem; font-weight: 900; color: #FFF; line-height: 1; }
-.cert-label { font-size: 0.58rem; color: #64748B; text-transform: uppercase; font-weight: 700; }
-
-.mg { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; margin-top: 10px; background: rgba(0,0,0,0.3); padding: 10px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.04); }
-.mb { text-align: center; }
-.ml { font-size: 0.65rem; color: #64748B; text-transform: uppercase; font-weight: 700; }
-.mv { font-size: 1.02rem; font-weight: 800; color: #FFF; margin-top: 1px; }
-.vg { color: #00E676 !important; } .vr { color: #FF3D71 !important; }
-.vc { color: #00E5FF !important; } .vy { color: #FFB300 !important; }
-
-.fb-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; justify-content: center; }
-.fb { font-size: 0.68rem; padding: 4px 10px; border-radius: 8px; font-weight: 700; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); color: #94A3B8; }
-.fb-hi { border-color: rgba(0,230,118,0.35); color: #00E676; background: rgba(0,230,118,0.06); }
-.fb-lo { border-color: rgba(255,61,113,0.25); color: #FF3D71; background: rgba(255,61,113,0.04); }
-.fb-mid { border-color: rgba(255,179,0,0.25); color: #FFB300; background: rgba(255,179,0,0.04); }
-
-.trap-warn { margin-top: 10px; padding: 8px 12px; border-radius: 8px; background: rgba(255,179,0,0.08); border: 1px solid rgba(255,179,0,0.3); font-size: 0.75rem; color: #FFB300; font-weight: 600; }
-@keyframes pulse { 0%,100% { opacity: 0.8; transform: scale(0.95); } 50% { opacity: 1; transform: scale(1.1); } }
-.live-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #00E676; box-shadow: 0 0 8px #00E676; animation: pulse 1.8s infinite; margin-right: 6px; }
-.sp { display: inline-block; font-size: 0.72rem; background: #111622; color: #00E5FF; padding: 3px 9px; border-radius: 10px; border: 1px solid #00E5FF; margin-left: 6px; font-weight: 700; }
-</style>
-"""
-
-st.markdown(DARK_CSS, unsafe_allow_html=True)
-
-# ── Header Bar ──
-hdr1, hdr2 = st.columns([2.6, 1.4])
-with hdr1:
-    m_badge = (
-        '<span style="font-size:0.75rem;font-weight:700;background:rgba(0,230,118,0.1);color:#00E676;'
-        'padding:3px 9px;border-radius:10px;border:1px solid #00E676;margin-left:8px;">🟢 MARKET OPEN</span>'
-        if is_nse_market_open() else
-        '<span style="font-size:0.75rem;font-weight:700;background:rgba(255,61,113,0.1);color:#FF3D71;'
-        'padding:3px 9px;border-radius:10px;border:1px solid #FF3D71;margin-left:8px;">🔴 MARKET CLOSED</span>'
-    )
-    st.markdown(
-        '<div style="display:flex;align-items:center;">'
-        '<span class="live-dot"></span>'
-        '<span style="font-size:1.3rem;font-weight:900;color:#FFF;">ALGO RADAR</span>'
-        '<span class="sp">v5.0 LUX</span>'
-        f'{m_badge}'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-with hdr2:
-    st.markdown(
-        f'<div style="text-align:right;padding-top:6px;font-size:0.72rem;color:#64748B;">'
-        f'{datetime.now(timezone.utc).strftime("%H:%M UTC")}</div>',
-        unsafe_allow_html=True,
-    )
-
-# Active Trade Manager
-if "active_trades" not in st.session_state:
-    st.session_state.active_trades = {"NIFTY": None, "BANKNIFTY": None}
-
-def lock_or_update_trade(sym: str, prediction: PredictionResult) -> PredictionResult:
-    active = st.session_state.active_trades.get(sym)
-    if active is None:
-        if prediction.signal in ("BUY_ATM_CE", "BUY_ATM_PE") and prediction.entry_premium > 0:
-            st.session_state.active_trades[sym] = {
-                "signal": prediction.signal,
-                "strike": prediction.strike,
-                "option_type": prediction.option_type,
-                "entry_premium": prediction.entry_premium,
-                "stop_loss": prediction.stop_loss,
-                "target": prediction.target,
+            payload = {
+                "type": "tick",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol,
+                "chain": {k: v for k, v in chain.items() if k != "chain"},
+                "oi_chart": chain["chain"],
+                "candles": candles,
+                "tech": {k: v for k, v in tech.items()
+                         if k not in ("vwap_line","ema9_line","ema21_line","st_line","vol_hist","vol_avg_line")},
+                "overlays": {
+                    "vwap": tech["vwap_line"], "ema9": tech["ema9_line"],
+                    "ema21": tech["ema21_line"], "st": tech["st_line"],
+                    "vol": tech["vol_hist"], "vol_avg": tech["vol_avg_line"],
+                },
+                "pred": pred,
+                "sentiment": {"score": sent_score, "headlines": headlines[:5]},
             }
-    else:
-        if prediction.signal == "NO_TRADE" or prediction.signal != active["signal"]:
-            st.session_state.active_trades[sym] = None
-        else:
-            prediction.entry_premium = active["entry_premium"]
-            prediction.stop_loss = active["stop_loss"]
-            prediction.target = active["target"]
-            prediction.strike = active["strike"]
-            prediction.option_type = active["option_type"]
-            prediction.signal = active["signal"]
-    return prediction
 
-# ── Sidebar Config ──
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    upstox_token = st.text_input("Upstox Token", type="password", placeholder="Optional")
-    st.markdown("---")
-    st.markdown("### Signal Logic")
-    st.markdown("- **BUY CE**: Confidence ≥ 75% + Bullish")
-    st.markdown("- **BUY PE**: Confidence ≥ 75% + Bearish")
-    st.markdown("- **NO TRADE**: Confidence < 75% / Trap")
-    st.markdown("- **SL**: 12% premium | **Tgt**: 1:2 R:R (24%)")
+            await websocket.send_json(payload)
+            await asyncio.sleep(2)
 
-# ── Symbol Tabs ──
-tabs = st.tabs(["🚀 NIFTY 50", "⚡ BANKNIFTY"])
+    except WebSocketDisconnect:
+        mgr.disconnect(websocket)
+    except Exception:
+        mgr.disconnect(websocket)
 
-for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
-    with tabs[idx]:
-        chain = generate_option_chain_snapshot(symbol, access_token=upstox_token)
-        ohlcv = generate_5min_ohlcv(symbol, chain.spot)
-        enriched_df, tech = compute_technicals(ohlcv)
-        sent_score, n_headlines, headlines = fetch_and_score_sentiment()
-        pred = run_prediction_engine(chain, tech, sent_score)
-        pred = lock_or_update_trade(symbol, pred)
 
-        if pred.signal == "BUY_ATM_CE":
-            hero_cls, badge_cls = "hero-ce", "badge-ce"
-            badge_txt = "🟢 BUY ATM CE"
-            ring_cls, accent = "ring-ce", "#00E676"
-        elif pred.signal == "BUY_ATM_PE":
-            hero_cls, badge_cls = "hero-pe", "badge-pe"
-            badge_txt = "🔴 BUY ATM PE"
-            ring_cls, accent = "ring-pe", "#FF3D71"
-        else:
-            hero_cls, badge_cls = "hero-nt", "badge-nt"
-            badge_txt = "⚪ NO TRADE"
-            ring_cls, accent = "ring-nt", "#64748B"
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  MODULE 6: EMBEDDED SINGLE-FILE HTML/TAILWIND/TRADINGVIEW TERMINAL     ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 
-        def _fb_cls(score: float) -> str:
-            if score >= 62: return "fb fb-hi"
-            elif score <= 40: return "fb fb-lo"
-            return "fb fb-mid"
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#07090e">
+<title>Algo Radar v5 | Bloomberg Dark Terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        obsidian: '#07090e',
+        card: '#111622',
+        card2: '#182030',
+        border: '#1e2638',
+        cyanAccent: '#00e5ff',
+        emeraldAccent: '#00e676',
+        coralAccent: '#ff3d71',
+        amberAccent: '#ffb300',
+      },
+      fontFamily: { sans: ['Inter', 'sans-serif'] }
+    }
+  }
+}
+</script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+body {
+  background-color: #07090e;
+  color: #e2e8f0;
+  font-family: 'Inter', sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-tap-highlight-color: transparent;
+  overflow-x: hidden;
+}
+.hero-glow-ce {
+  border: 2px solid #00e676;
+  box-shadow: 0 0 35px rgba(0, 230, 118, 0.2), inset 0 0 40px rgba(0, 230, 118, 0.05);
+}
+.hero-glow-pe {
+  border: 2px solid #ff3d71;
+  box-shadow: 0 0 35px rgba(255, 61, 113, 0.2), inset 0 0 40px rgba(255, 61, 113, 0.05);
+}
+.hero-glow-nt {
+  border: 1px solid #1e2638;
+}
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.8; transform: scale(0.96); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+.pulse-dot {
+  animation: pulseGlow 1.8s infinite;
+}
+</style>
+</head>
+<body class="min-h-full flex flex-col antialiased selection:bg-cyanAccent/30 selection:text-white">
 
-        pct_deg = f"{pred.confidence * 3.6:.0f}deg"
+<!-- TOP HEADER BAR -->
+<header class="sticky top-0 z-50 backdrop-blur-md bg-obsidian/90 border-b border-border px-3 py-2.5 sm:px-6">
+  <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2">
+    
+    <div class="flex items-center gap-3">
+      <div class="w-2.5 h-2.5 rounded-full bg-emeraldAccent pulse-dot shadow-[0_0_8px_#00e676]"></div>
+      <span class="font-black text-lg sm:text-xl tracking-wider text-white">ALGO RADAR <span class="text-xs font-bold text-cyanAccent bg-card border border-cyanAccent/40 px-2 py-0.5 rounded-md">v5 LUX</span></span>
+      <div id="mktStatusPill" class="text-xs font-bold px-2.5 py-1 rounded-full border transition-all">Checking...</div>
+    </div>
 
-        card = textwrap.dedent(f"""
-        <div class="hero-card {hero_cls}">
-            <div class="hero-header">
-                <div>
-                    <h2 class="sym-big">{symbol}</h2>
-                    <span style="font-size:0.82rem;color:#94A3B8;">
-                        Spot: <b style="color:#FFF">₹{chain.spot:,.2f}</b> &nbsp;|&nbsp;
-                        H: <b class="vg">₹{chain.day_high:,.0f}</b> &nbsp;
-                        L: <b class="vr">₹{chain.day_low:,.0f}</b> &nbsp;|&nbsp;
-                        VIX: <b class="vy">{chain.vix:.1f}</b>
-                    </span>
-                </div>
-                <div class="badge {badge_cls}">{badge_txt}</div>
-            </div>
+    <div class="flex bg-card p-1 rounded-xl border border-border">
+      <button id="btnNifty" onclick="switchSymbol('NIFTY')" class="min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all bg-card2 text-white shadow-md border border-cyanAccent/30">🚀 NIFTY 50</button>
+      <button id="btnBankNifty" onclick="switchSymbol('BANKNIFTY')" class="min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all text-slate-400 hover:text-white">⚡ BANKNIFTY</button>
+    </div>
 
-            <!-- AI Certainty Ring -->
-            <div class="certainty-ring {ring_cls}" style="--pct: {pct_deg}">
-                <span class="cert-pct">{pred.confidence:.1f}%</span>
-                <span class="cert-label">AI Certainty</span>
-            </div>
-            <div style="text-align:center;font-size:0.72rem;color:{accent};font-weight:800;letter-spacing:1px;margin-bottom:4px;">
-                {'🔥 ' + pred.conviction_level + ' CONVICTION' if pred.conviction_level in ('HIGH','VERY HIGH') else pred.conviction_level + ' CONVICTION'} — {pred.strategy_name.upper()}
-            </div>
+    <div class="flex items-center gap-2 text-xs font-bold">
+      <div id="spotPill" class="bg-card px-3 py-1.5 rounded-lg border border-border text-cyanAccent">SPOT: —</div>
+      <div id="vixPill" class="bg-amberAccent/10 px-3 py-1.5 rounded-lg border border-amberAccent/30 text-amberAccent">INDIA VIX —</div>
+    </div>
 
-            <!-- Multi-Agent Consensus Pill Badges -->
-            <div class="fb-row">
-                <span class="{_fb_cls(pred.score_price_action)}">📈 Price: {pred.pa_label} ({pred.pa_pts}/35)</span>
-                <span class="{_fb_cls(pred.score_option_flow)}">📊 OI: {pred.oi_label} ({pred.of_pts}/35)</span>
-                <span class="{_fb_cls(pred.score_sentiment)}">📰 News: {sent_score:+.2f} ({pred.se_pts}/15)</span>
-                <span class="{_fb_cls(pred.score_greeks_vol)}">🛡 Trap: {pred.trap_status}</span>
-            </div>
+  </div>
+</header>
 
-            <!-- Trade Metrics Grid -->
-            <div class="mg">
-                <div class="mb"><div class="ml">Strike</div><div class="mv vc">{int(pred.strike)} {pred.option_type}</div></div>
-                <div class="mb"><div class="ml">Entry</div><div class="mv">₹{pred.entry_premium:.1f}</div></div>
-                <div class="mb"><div class="ml">Stop-Loss 12%</div><div class="mv vr">₹{pred.stop_loss:.1f}</div></div>
-            </div>
-            <div class="mg" style="margin-top:5px;">
-                <div class="mb"><div class="ml">Target (1:2)</div><div class="mv vg">₹{pred.target:.1f}</div></div>
-                <div class="mb"><div class="ml">PCR</div><div class="mv vy">{chain.pcr:.2f}</div></div>
-                <div class="mb"><div class="ml">Sentiment</div><div class="mv {'vg' if sent_score>0 else 'vr'}">{sent_score:+.2f}</div></div>
-            </div>
-            <div class="mg" style="margin-top:5px;">
-                <div class="mb"><div class="ml">ADX</div><div class="mv">{tech.adx:.1f}</div></div>
-                <div class="mb"><div class="ml">RSI</div><div class="mv {'vr' if tech.rsi>70 else 'vg' if tech.rsi<30 else ''}">{tech.rsi:.0f}</div></div>
-                <div class="mb"><div class="ml">Delta</div><div class="mv">{pred.delta_selected:.2f}</div></div>
-            </div>
+<!-- MAIN LAYOUT -->
+<main class="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-6 space-y-4">
 
-            {'<div class="trap-warn">' + pred.trap_warning + '</div>' if pred.trap_warning else ''}
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+
+    <!-- LEFT/CENTER COLUMN (7 cols): HERO CARD & CANDLESTICK CHART -->
+    <div class="lg:col-span-7 space-y-4">
+      
+      <!-- HERO CONVICTION CARD -->
+      <div id="heroCard" class="bg-card rounded-2xl p-4 sm:p-6 hero-glow-nt transition-all duration-500">
+        <div class="flex items-center justify-between">
+          <div>
+            <h1 id="heroSym" class="text-xl sm:text-2xl font-black text-white">NIFTY 50</h1>
+            <div id="heroSub" class="text-xs text-slate-400 mt-0.5">Spot: <b class="text-white">—</b> · H: <b class="text-emeraldAccent">—</b> · L: <b class="text-coralAccent">—</b></div>
+          </div>
+          <div id="heroBadge" class="px-4 py-1.5 rounded-full text-xs font-black uppercase tracking-wider bg-border text-slate-400">CONNECTING...</div>
         </div>
-        """)
-        st.html(card)
 
-        # Candlestick Chart
-        st.markdown(
-            "<p style='font-size:0.78rem;font-weight:700;color:#94A3B8;margin:0 0 2px;'>"
-            "5-MIN CANDLESTICK — VWAP · EMA 9/21 · SUPERTREND · ENTRY/SL/TGT · VOLUME</p>",
-            unsafe_allow_html=True,
-        )
-        st.plotly_chart(
-            build_candlestick_chart(
-                enriched_df, pred.signal, tech,
-                entry_price=pred.entry_premium,
-                target_price=pred.target,
-                stop_loss=pred.stop_loss,
-            ),
-            width="stretch", config={"displayModeBar": False},
-        )
+        <!-- Radial AI Certainty Gauge -->
+        <div class="flex flex-col items-center justify-center my-4">
+          <div class="relative w-28 h-28 flex items-center justify-center">
+            <svg class="w-full h-full transform -rotate-90" viewBox="0 0 120 120">
+              <circle cx="60" cy="60" r="50" fill="none" stroke="#182030" stroke-width="8"/>
+              <circle id="gaugeArc" cx="60" cy="60" r="50" fill="none" stroke="#64748b" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 314" class="transition-all duration-700"/>
+            </svg>
+            <div class="absolute inset-0 flex flex-col items-center justify-center text-center">
+              <span id="gaugePct" class="text-2xl font-black text-white">0.0%</span>
+              <span class="text-[9px] font-bold text-slate-400 uppercase tracking-widest">AI Certainty</span>
+            </div>
+          </div>
+          <div id="convLine" class="text-xs font-black tracking-wider uppercase mt-2 text-slate-400">—</div>
+        </div>
 
-        # PCR Gauge & OI Bar Chart
-        bc1, bc2 = st.columns([1, 1.6])
-        with bc1:
-            st.markdown("<p style='font-size:0.72rem;font-weight:700;color:#94A3B8;margin:0;'>PCR GAUGE</p>", unsafe_allow_html=True)
-            st.plotly_chart(build_pcr_gauge(chain.pcr), width="stretch", config={"displayModeBar": False})
-        with bc2:
-            st.markdown("<p style='font-size:0.72rem;font-weight:700;color:#94A3B8;margin:0;'>STRIKE-WISE OI CHANGE</p>", unsafe_allow_html=True)
-            st.plotly_chart(build_oi_chart(chain.df_chain, chain.atm_strike), width="stretch", config={"displayModeBar": False})
+        <!-- Multi-Agent Consensus Pill Badges -->
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs">
+          <div id="fpPA" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">📈 Price: —</div>
+          <div id="fpOI" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">📊 OI: —</div>
+          <div id="fpSent" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">📰 News: —</div>
+          <div id="fpTrap" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">🛡 Trap: —</div>
+        </div>
 
-        # AI Rationale & Headlines
-        with st.expander("📋 AI Rationale & News Headlines", expanded=False):
-            st.markdown(f"**Regime:** `{pred.regime}` → **Strategy:** `{pred.strategy_name}`")
-            st.markdown(f"**Signal:** `{pred.signal}` — **Confidence:** `{pred.confidence:.1f}%` ({pred.conviction_level})")
-            st.info(pred.reason)
-            if headlines:
-                st.markdown("**Latest Headlines Scored (FinBERT):**")
-                st.dataframe(pd.DataFrame(headlines), width="stretch", hide_index=True)
+        <!-- Trade Metrics Grid -->
+        <div class="grid grid-cols-3 gap-2 mt-4 bg-obsidian/40 p-3 rounded-xl border border-border/50 text-center">
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Strike</div><div id="mStrike" class="text-sm font-extrabold text-cyanAccent">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Entry</div><div id="mEntry" class="text-sm font-extrabold text-white">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">SL (12%)</div><div id="mSL" class="text-sm font-extrabold text-coralAccent">—</div></div>
+        </div>
+        <div class="grid grid-cols-3 gap-2 mt-2 bg-obsidian/40 p-3 rounded-xl border border-border/50 text-center">
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Target (1:2)</div><div id="mTgt" class="text-sm font-extrabold text-emeraldAccent">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">PCR</div><div id="mPCR" class="text-sm font-extrabold text-amberAccent">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Delta</div><div id="mDelta" class="text-sm font-extrabold text-white">—</div></div>
+        </div>
+        <div class="grid grid-cols-3 gap-2 mt-2 bg-obsidian/40 p-3 rounded-xl border border-border/50 text-center">
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">ADX</div><div id="mADX" class="text-sm font-extrabold text-white">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">RSI</div><div id="mRSI" class="text-sm font-extrabold text-white">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Regime</div><div id="mRegime" class="text-xs font-bold text-slate-300 uppercase mt-0.5">—</div></div>
+        </div>
+
+        <div id="trapBar" class="hidden mt-3 p-2.5 rounded-xl bg-amberAccent/10 border border-amberAccent/30 text-xs font-semibold text-amberAccent"></div>
+      </div>
+
+      <!-- TRADINGVIEW LIGHTWEIGHT CHARTS CONTAINER -->
+      <div class="bg-card rounded-2xl p-3 border border-border overflow-hidden">
+        <div class="text-xs font-bold text-slate-400 mb-2 flex items-center justify-between px-1">
+          <span>5-MIN CHART — VWAP · EMA 9/21 · SUPERTREND · ENTRY/SL/TGT</span>
+          <span class="text-[10px] text-cyanAccent font-mono">LIVE WEBSOCKET STREAM</span>
+        </div>
+        <div id="tvChart" class="w-full h-[400px]"></div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT COLUMN (5 cols): AI CONSENSUS, STRIKE LADDER, PCR & SENTIMENT -->
+    <div class="lg:col-span-5 space-y-4">
+      
+      <!-- PCR Sentiment Semi-Circle Gauge -->
+      <div class="bg-card rounded-2xl p-4 border border-border flex flex-col items-center">
+        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider self-start mb-2">PCR Sentiment Dynamics</div>
+        <div class="relative w-40 h-24 flex items-center justify-center">
+          <svg width="160" height="95" viewBox="0 0 160 95">
+            <path d="M 15 80 A 65 65 0 0 1 145 80" fill="none" stroke="#182030" stroke-width="12" stroke-linecap="round"/>
+            <path id="pcrArc" d="M 15 80 A 65 65 0 0 1 145 80" fill="none" stroke="#00e5ff" stroke-width="12" stroke-linecap="round" stroke-dasharray="0 204" class="transition-all duration-700"/>
+            <text id="pcrArcVal" x="80" y="65" text-anchor="middle" fill="#ffffff" font-size="20" font-weight="900">0.00</text>
+            <text x="80" y="78" text-anchor="middle" fill="#64748b" font-size="9" font-weight="700">PCR LEVEL</text>
+          </svg>
+        </div>
+        <div id="pcrShift" class="text-xs font-bold text-slate-300 mt-1">15m shift: —</div>
+      </div>
+
+      <!-- Strike-wise Call vs Put Change in OI Bar Chart -->
+      <div class="bg-card rounded-2xl p-4 border border-border">
+        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Strike-wise OI Flow (Call vs Put)</div>
+        <canvas id="oiChart" class="w-full h-[200px]"></canvas>
+      </div>
+
+      <!-- Live FinBERT News Sentiment Scored Headlines -->
+      <div class="bg-card rounded-2xl p-4 border border-border space-y-3">
+        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+          <span>AI News Sentiment (FinBERT)</span>
+          <span id="sentVal" class="text-cyanAccent font-bold">0.00</span>
+        </div>
+        <div class="flex items-center gap-2 p-2 rounded-xl bg-card2 border border-border text-xs">
+          <div id="sentDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></div>
+          <div id="sentDesc" class="text-slate-300 font-semibold">Awaiting feed...</div>
+        </div>
+        <div id="headlineList" class="space-y-2 text-xs divide-y divide-border/50"></div>
+      </div>
+
+    </div>
+
+  </div>
+
+</main>
+
+<footer class="text-center py-4 text-xs font-semibold text-slate-600 border-t border-border/50 mt-6">
+  ⚡ Algo Radar v5 — Institutional Terminal · Zero-Flicker WebSocket Stream
+</footer>
+
+<!-- FRONTEND JAVASCRIPT ENGINE -->
+<script>
+let ws, symbol = 'NIFTY', chart, candleSeries, volSeries;
+let vwapLine, ema9Line, ema21Line, stLine, volAvgLine;
+let priceLines = [];
+let firstRender = true;
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const host = location.hostname || 'localhost';
+  const port = (location.port && location.port !== '8501') ? location.port : '8000';
+  const wsUrl = `${proto}://${host}:${port}/ws`;
+
+  ws = new WebSocket(wsUrl);
+  ws.onopen = () => { ws.send(JSON.stringify({symbol})); };
+  ws.onmessage = (e) => { try { onTick(JSON.parse(e.data)); } catch(err){ console.error(err); } };
+  ws.onclose = () => { setTimeout(connectWS, 2000); };
+  ws.onerror = () => { ws.close(); };
+}
+
+function switchSymbol(sym) {
+  symbol = sym;
+  document.getElementById('btnNifty').className = sym === 'NIFTY' 
+    ? 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all bg-card2 text-white shadow-md border border-cyanAccent/30'
+    : 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all text-slate-400 hover:text-white';
+  document.getElementById('btnBankNifty').className = sym === 'BANKNIFTY'
+    ? 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all bg-card2 text-white shadow-md border border-cyanAccent/30'
+    : 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all text-slate-400 hover:text-white';
+
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({symbol}));
+  firstRender = true;
+  clearPriceLines();
+}
+
+function initTVChart() {
+  const el = document.getElementById('tvChart');
+  chart = LightweightCharts.createChart(el, {
+    width: el.clientWidth,
+    height: 400,
+    layout: { background: { type: 'solid', color: '#07090e' }, textColor: '#64748b', fontSize: 11 },
+    grid: { vertLines: { color: 'rgba(255,255,255,0.03)' }, horzLines: { color: 'rgba(255,255,255,0.03)' } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#1e2638', scaleMargins: { top: 0.08, bottom: 0.22 } },
+    timeScale: { borderColor: '#1e2638', timeVisible: true, secondsVisible: false },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
+    handleScale: { mouseWheel: true, pinch: true },
+  });
+
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#00e676', downColor: '#ff3d71',
+    borderUpColor: '#00e676', borderDownColor: '#ff3d71',
+    wickUpColor: '#00e676', wickDownColor: '#ff3d71',
+  });
+
+  volSeries = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol' });
+  chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+  vwapLine = chart.addLineSeries({ color: '#00e5ff', lineWidth: 1, lineStyle: 1 });
+  ema9Line = chart.addLineSeries({ color: '#ffb300', lineWidth: 1 });
+  ema21Line = chart.addLineSeries({ color: '#e040fb', lineWidth: 1 });
+  stLine = chart.addLineSeries({ color: '#00e676', lineWidth: 1 });
+  volAvgLine = chart.addLineSeries({ color: '#ffb300', lineWidth: 1, priceScaleId: 'vol' });
+
+  window.addEventListener('resize', () => { chart.applyOptions({ width: el.clientWidth }); });
+}
+
+function clearPriceLines() {
+  priceLines.forEach(pl => { try { candleSeries.removePriceLine(pl); } catch(e){} });
+  priceLines = [];
+}
+
+function updatePriceLines(p) {
+  clearPriceLines();
+  if (p.signal === 'NO_TRADE' || p.entry <= 0) return;
+
+  priceLines.push(candleSeries.createPriceLine({
+    price: p.entry, color: '#ffd600', lineWidth: 2, lineStyle: 0,
+    axisLabelVisible: true, title: 'ENTRY ₹' + p.entry.toFixed(1),
+  }));
+  priceLines.push(candleSeries.createPriceLine({
+    price: p.target, color: '#00e676', lineWidth: 1, lineStyle: 2,
+    axisLabelVisible: true, title: 'TARGET (1:2) ₹' + p.target.toFixed(1),
+  }));
+  priceLines.push(candleSeries.createPriceLine({
+    price: p.sl, color: '#ff3d71', lineWidth: 1, lineStyle: 2,
+    axisLabelVisible: true, title: 'SL (12%) ₹' + p.sl.toFixed(1),
+  }));
+}
+
+function onTick(d) {
+  const ch = d.chain, p = d.pred, t = d.tech, s = d.sentiment;
+
+  // Header pills
+  const mktPill = document.getElementById('mktStatusPill');
+  if (ch.market_open) {
+    mktPill.textContent = '🟢 MARKET OPEN';
+    mktPill.className = 'text-xs font-bold px-2.5 py-1 rounded-full border bg-emeraldAccent/10 text-emeraldAccent border-emeraldAccent/30';
+  } else {
+    mktPill.textContent = '🔴 MARKET CLOSED';
+    mktPill.className = 'text-xs font-bold px-2.5 py-1 rounded-full border bg-coralAccent/10 text-coralAccent border-coralAccent/30';
+  }
+
+  document.getElementById('spotPill').textContent = 'SPOT: ₹' + ch.spot.toLocaleString('en-IN', {maximumFractionDigits:2});
+  document.getElementById('vixPill').textContent = 'INDIA VIX ' + ch.vix;
+
+  // Hero Card State
+  const hero = document.getElementById('heroCard');
+  const badge = document.getElementById('heroBadge');
+  hero.className = 'bg-card rounded-2xl p-4 sm:p-6 transition-all duration-500 ' + 
+    (p.signal === 'BUY_ATM_CE' ? 'hero-glow-ce' : p.signal === 'BUY_ATM_PE' ? 'hero-glow-pe' : 'hero-glow-nt');
+  
+  badge.textContent = p.signal === 'BUY_ATM_CE' ? '🟢 BUY ATM CE' : p.signal === 'BUY_ATM_PE' ? '🔴 BUY ATM PE' : '⚪ NO TRADE';
+  badge.className = 'px-4 py-1.5 rounded-full text-xs font-black uppercase tracking-wider shadow-lg ' +
+    (p.signal === 'BUY_ATM_CE' ? 'bg-emeraldAccent text-obsidian' : p.signal === 'BUY_ATM_PE' ? 'bg-coralAccent text-white' : 'bg-border text-slate-400');
+
+  document.getElementById('heroSym').textContent = d.symbol;
+  document.getElementById('heroSub').innerHTML =
+    `Spot: <b class="text-white">₹${ch.spot.toLocaleString('en-IN')}</b> · H: <b class="text-emeraldAccent">₹${ch.day_high.toLocaleString('en-IN')}</b> · L: <b class="text-coralAccent">₹${ch.day_low.toLocaleString('en-IN')}</b>`;
+
+  // AI Gauge Arc
+  const pct = p.confidence;
+  const arc = document.getElementById('gaugeArc');
+  const dash = (pct / 100) * 314;
+  const accentColor = p.signal === 'BUY_ATM_CE' ? '#00e676' : p.signal === 'BUY_ATM_PE' ? '#ff3d71' : '#64748b';
+  arc.setAttribute('stroke', accentColor);
+  arc.setAttribute('stroke-dasharray', dash + ' 314');
+  document.getElementById('gaugePct').textContent = pct.toFixed(1) + '%';
+  
+  const conv = document.getElementById('convLine');
+  conv.textContent = (p.conviction === 'HIGH' || p.conviction === 'VERY HIGH' ? '🔥 ' : '') + p.conviction + ' CONVICTION — ' + p.strategy.toUpperCase();
+  conv.style.color = accentColor;
+
+  // Consensus Pills
+  document.getElementById('fpPA').textContent = `📈 Price: ${p.pa_label} (${p.pa_pts}/35)`;
+  document.getElementById('fpOI').textContent = `📊 OI: ${p.oi_label} (${p.of_pts}/35)`;
+  document.getElementById('fpSent').textContent = `📰 News: ${s.score >= 0 ? '+' : ''}${s.score.toFixed(2)} (${p.se_pts}/15)`;
+  document.getElementById('fpTrap').textContent = `🛡 Trap: ${p.trap_status}`;
+
+  // Trade metrics
+  document.getElementById('mStrike').textContent = p.strike + ' ' + p.option_type;
+  document.getElementById('mEntry').textContent = p.entry > 0 ? '₹' + p.entry.toFixed(1) : '—';
+  document.getElementById('mSL').textContent = p.sl > 0 ? '₹' + p.sl.toFixed(1) : '—';
+  document.getElementById('mTgt').textContent = p.target > 0 ? '₹' + p.target.toFixed(1) : '—';
+  document.getElementById('mPCR').textContent = ch.pcr.toFixed(2);
+  document.getElementById('mDelta').textContent = p.delta > 0 ? p.delta.toFixed(2) : '—';
+  document.getElementById('mADX').textContent = t.adx.toFixed(1);
+  document.getElementById('mRSI').textContent = t.rsi.toFixed(0);
+  document.getElementById('mRegime').textContent = p.regime.replace('_', ' ');
+
+  const trapBar = document.getElementById('trapBar');
+  if (p.trap_warning) {
+    trapBar.textContent = '⚠️ ' + p.trap_warning;
+    trapBar.classList.remove('hidden');
+  } else {
+    trapBar.classList.add('hidden');
+  }
+
+  // TradingView Lightweight Charts Streaming (Zero Flicker)
+  const candles = d.candles.map(c => ({time: c.time, open: c.open, high: c.high, low: c.low, close: c.close}));
+  if (firstRender) {
+    candleSeries.setData(candles);
+    volSeries.setData(d.overlays.vol);
+    vwapLine.setData(d.overlays.vwap);
+    ema9Line.setData(d.overlays.ema9);
+    ema21Line.setData(d.overlays.ema21);
+    stLine.setData(d.overlays.st);
+    volAvgLine.setData(d.overlays.vol_avg);
+    chart.timeScale().fitContent();
+    firstRender = false;
+  } else {
+    const lastC = candles[candles.length - 1];
+    candleSeries.update(lastC);
+    volSeries.update(d.overlays.vol[d.overlays.vol.length - 1]);
+    vwapLine.update(d.overlays.vwap[d.overlays.vwap.length - 1]);
+    ema9Line.update(d.overlays.ema9[d.overlays.ema9.length - 1]);
+    ema21Line.update(d.overlays.ema21[d.overlays.ema21.length - 1]);
+    stLine.applyOptions({ color: t.st_dir === 1 ? '#00e676' : '#ff3d71' });
+    stLine.update(d.overlays.st[d.overlays.st.length - 1]);
+    volAvgLine.update(d.overlays.vol_avg[d.overlays.vol_avg.length - 1]);
+  }
+
+  // Signal Markers & Price Lines
+  if (p.signal !== 'NO_TRADE' && candles.length > 0) {
+    const lastC = candles[candles.length - 1];
+    candleSeries.setMarkers([{
+      time: lastC.time,
+      position: p.signal === 'BUY_ATM_CE' ? 'belowBar' : 'aboveBar',
+      color: p.signal === 'BUY_ATM_CE' ? '#00e676' : '#ff3d71',
+      shape: p.signal === 'BUY_ATM_CE' ? 'arrowUp' : 'arrowDown',
+      text: p.signal === 'BUY_ATM_CE' ? 'CE' : 'PE',
+    }]);
+  } else {
+    candleSeries.setMarkers([]);
+  }
+  updatePriceLines(p);
+
+  // PCR Gauge
+  const pcrVal = ch.pcr;
+  const pcrNorm = Math.min(1, Math.max(0, (pcrVal - 0.4) / 1.4));
+  const pcrArc = document.getElementById('pcrArc');
+  pcrArc.setAttribute('stroke', pcrVal > 1.1 ? '#00e676' : pcrVal < 0.85 ? '#ff3d71' : '#00e5ff');
+  pcrArc.setAttribute('stroke-dasharray', (pcrNorm * 204) + ' 204');
+  document.getElementById('pcrArcVal').textContent = pcrVal.toFixed(2);
+  
+  const sh = ch.pcr_shift;
+  document.getElementById('pcrShift').innerHTML = `15m shift: <b style="color:${sh >= 0 ? '#00e676' : '#ff3d71'}">${sh >= 0 ? '+' : ''}${sh.toFixed(3)}</b>`;
+
+  // Canvas OI Chart
+  drawOIChart(d.oi_chart, ch.atm);
+
+  // News Sentiment
+  const sentDot = document.getElementById('sentDot');
+  sentDot.className = 'w-2.5 h-2.5 rounded-full ' + (s.score > 0.15 ? 'bg-emeraldAccent' : s.score < -0.15 ? 'bg-coralAccent' : 'bg-amberAccent');
+  document.getElementById('sentVal').textContent = (s.score >= 0 ? '+' : '') + s.score.toFixed(2);
+  document.getElementById('sentDesc').textContent = s.score > 0.15 ? 'Bullish Market Sentiment' : s.score < -0.15 ? 'Bearish Market Sentiment' : 'Neutral Market Sentiment';
+
+  let hlHtml = '';
+  s.headlines.forEach(h => {
+    const sc = h.score;
+    const clr = sc > 0.15 ? 'text-emeraldAccent' : sc < -0.15 ? 'text-coralAccent' : 'text-amberAccent';
+    hlHtml += `<div class="pt-2 flex items-start gap-2"><span class="font-bold ${clr} shrink-0">${sc >= 0 ? '+' : ''}${sc.toFixed(2)}</span><span class="text-slate-300 font-medium">${h.title}</span></div>`;
+  });
+  document.getElementById('headlineList').innerHTML = hlHtml;
+}
+
+// Canvas OI Chart Renderer
+function drawOIChart(data, atm) {
+  const canvas = document.getElementById('oiChart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const W = Math.floor(rect.width);
+  const H = 200;
+
+  if (canvas.width !== Math.floor(W * dpr) || canvas.height !== Math.floor(H * dpr)) {
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+  }
+
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  if (!data || data.length === 0) return;
+  const n = data.length;
+  const gap = (W - 30) / n;
+  const bw = Math.max(3, gap / 2.5);
+  const maxVal = Math.max(1, ...data.map(d => Math.max(Math.abs(d.c_chg), Math.abs(d.p_chg))));
+  const midY = H / 2;
+  const scaleY = (midY - 25) / maxVal;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(15, midY); ctx.lineTo(W - 15, midY); ctx.stroke();
+
+  data.forEach((d, i) => {
+    const x = 20 + i * gap;
+    const ch = d.c_chg * scaleY;
+    ctx.fillStyle = 'rgba(255,61,113,0.85)';
+    ctx.fillRect(x, midY - Math.max(0, ch), bw, Math.abs(ch) || 1);
+
+    const ph = d.p_chg * scaleY;
+    ctx.fillStyle = 'rgba(0,230,118,0.85)';
+    ctx.fillRect(x + bw + 1, midY - Math.max(0, ph), bw, Math.abs(ph) || 1);
+
+    ctx.fillStyle = '#64748b';
+    ctx.font = '9px Inter';
+    ctx.textAlign = 'center';
+    ctx.fillText(d.strike.toString(), x + bw, H - 4);
+
+    if (Math.abs(d.strike - atm) < 1) {
+      ctx.strokeStyle = '#00e5ff';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x + bw, 10); ctx.lineTo(x + bw, H - 16); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#00e5ff';
+      ctx.font = 'bold 9px Inter';
+      ctx.fillText('ATM', x + bw, 8);
+    }
+  });
+
+  ctx.restore();
+}
+
+// Init
+initTVChart();
+connectWS();
+</script>
+</body>
+</html>"""
 
 
-# Footer
-st.markdown(
-    f'<div style="text-align:center;padding:10px 0;color:#64748B;font-size:0.72rem;">'
-    f'⚡ Algo Radar v5 LUX — Real-Time Signal Engine'
-    f' | UTC: {datetime.now(timezone.utc).strftime("%H:%M:%S")}</div>',
-    unsafe_allow_html=True,
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  MODULE 7: STREAMLIT EMBEDDING ENGINE & BACKGROUND SERVER                ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def _is_port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('127.0.0.1', port)) == 0
+
+def _run_fastapi_server():
+    if not _is_port_in_use(8000):
+        try:
+            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+        except Exception:
+            pass
+
+# Start background FastAPI WebSocket thread once
+if "fastapi_server_started" not in st.session_state:
+    st.session_state["fastapi_server_started"] = True
+    t = threading.Thread(target=_run_fastapi_server, daemon=True)
+    t.start()
+
+st.set_page_config(
+    page_title="Algo Radar v5 | NIFTY & BANKNIFTY Terminal",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-col_r1, col_r2, col_r3 = st.columns([1, 1, 1])
-with col_r2:
-    if st.button("🔄 Refresh Data", type="primary"):
-        st.rerun()
+st.markdown("""
+<style>
+[data-testid="stAppViewContainer"] {
+    padding: 0 !important;
+    background-color: #07090e !important;
+}
+[data-testid="stHeader"] {
+    display: none !important;
+}
+.block-container {
+    padding: 0 !important;
+    max-width: 100% !important;
+}
+iframe {
+    border: none !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Render high-performance WebSocket terminal inside Streamlit
+components.html(HTML_TEMPLATE, height=1400, scrolling=True)
