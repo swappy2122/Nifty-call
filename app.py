@@ -1,17 +1,19 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
- ALGO RADAR v5 — Institutional Mobile-First Streamlit Trading Terminal
+ ALGO RADAR v5 — LUXURY BLOOMBERG DARK TERMINAL (NATIVE STREAMLIT)
  NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Engine
 ═══════════════════════════════════════════════════════════════════════════════
  100% Cross-Device Compatible (iPhone 15, Android, iPad, MacBook, Streamlit Cloud)
  Features:
+  - Luxury Apple/Bloomberg Dark Obsidian Theme (#07090e)
   - Zero hardcoded localhost port dependencies (works on all mobile networks & HTTPS)
   - Mobile-first responsive touch layout (iOS safe-area insets, crisp typography)
+  - Circular SVG AI Certainty Radial Gauge & 4-Agent Consensus Breakdown
   - Upstox API v2 / High-fidelity option chain simulation
   - FinBERT AI News Sentiment (Moneycontrol & ET RSS)
   - 5-Min Multi-Indicator Technical Engine (VWAP, Supertrend, 9/21 EMA, ADX)
-  - Multi-Agent AI Consensus Radar (35% PA + 35% OI + 15% Sent + 15% Greeks)
   - Plotly Candlestick Chart with Entry/SL/Target overlays & uirevision zoom lock
+  - PCR Semi-Circle Radial Gauge & Strike-wise OI Flow Chart
   - Active Trade Locking in st.session_state (locks SL/Target across refreshes)
   - NSE Market Hours check with static data freeze when closed
 
@@ -49,7 +51,7 @@ import requests
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.set_page_config(
-    page_title="Algo Radar v5 | NIFTY & BANKNIFTY",
+    page_title="Algo Radar v5 | Bloomberg Dark Terminal",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -656,7 +658,7 @@ def build_oi_chart(df: pd.DataFrame, atm_strike: float) -> go.Figure:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 6: STREAMLIT DASHBOARD UI ENGINE                                ║
+# ║  MODULE 6: LUXURY BLOOMBERG DARK STYLES & LAYOUT                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 DARK_CSS = """
@@ -670,75 +672,75 @@ DARK_CSS = """
     font-variant-numeric: tabular-nums;
 }
 [data-testid="stHeader"] {
-    background: rgba(7,9,14,0.92);
+    background: rgba(7,9,14,0.95);
     backdrop-filter: blur(16px);
 }
 .block-container {
-    padding: 0.5rem 0.5rem 2rem !important;
-    max-width: 1100px !important;
+    padding: 0.4rem 0.5rem 2rem !important;
+    max-width: 1200px !important;
 }
+
+/* Luxury Hero Conviction Card */
 .hero-card {
-    border-radius: 18px;
-    padding: 16px 14px;
-    margin-bottom: 12px;
+    border-radius: 20px;
+    padding: 20px 18px;
+    margin-bottom: 14px;
     position: relative;
     overflow: hidden;
     transition: all 0.4s ease;
 }
 .hero-ce {
-    background: linear-gradient(135deg, rgba(0,230,118,0.08) 0%, rgba(17,22,34,0.98) 100%);
+    background: linear-gradient(135deg, rgba(0,230,118,0.10) 0%, rgba(17,22,34,0.98) 100%);
     border: 2px solid #00E676;
-    box-shadow: 0 0 35px rgba(0,230,118,0.2), inset 0 0 40px rgba(0,230,118,0.04);
+    box-shadow: 0 0 40px rgba(0,230,118,0.22), inset 0 0 50px rgba(0,230,118,0.05);
 }
 .hero-pe {
-    background: linear-gradient(135deg, rgba(255,61,113,0.08) 0%, rgba(17,22,34,0.98) 100%);
+    background: linear-gradient(135deg, rgba(255,61,113,0.10) 0%, rgba(17,22,34,0.98) 100%);
     border: 2px solid #FF3D71;
-    box-shadow: 0 0 35px rgba(255,61,113,0.2), inset 0 0 40px rgba(255,61,113,0.04);
+    box-shadow: 0 0 40px rgba(255,61,113,0.22), inset 0 0 50px rgba(255,61,113,0.05);
 }
 .hero-nt {
     background: #111622;
     border: 1px solid #1E2638;
 }
 .hero-header { display: flex; justify-content: space-between; align-items: center; }
-.sym-big { font-size: 1.45rem; font-weight: 900; color: #FFF; margin: 0; }
-.badge { padding: 5px 12px; border-radius: 22px; font-weight: 800; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 1px; }
-.badge-ce { background: #00E676; color: #07090E; box-shadow: 0 0 14px #00E676; }
-.badge-pe { background: #FF3D71; color: #FFF; box-shadow: 0 0 14px #FF3D71; }
+.sym-big { font-size: 1.6rem; font-weight: 900; color: #FFF; margin: 0; letter-spacing: 0.5px; }
+.badge { padding: 6px 16px; border-radius: 24px; font-weight: 800; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 1px; }
+.badge-ce { background: #00E676; color: #07090E; box-shadow: 0 0 16px #00E676; }
+.badge-pe { background: #FF3D71; color: #FFF; box-shadow: 0 0 16px #FF3D71; }
 .badge-nt { background: #1E2638; color: #64748B; }
 
-.certainty-ring {
-    width: 105px; height: 105px; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center; flex-direction: column;
-    margin: 10px auto 6px; position: relative;
+/* SVG Certainty Gauge */
+.gauge-container {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    margin: 14px 0 8px; position: relative;
 }
-.certainty-ring::before {
-    content: ''; position: absolute; inset: 0; border-radius: 50%; padding: 4px;
-    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-    mask-composite: exclude; -webkit-mask-composite: xor;
-}
-.ring-ce::before { background: conic-gradient(#00E676 var(--pct), #182030 0); }
-.ring-pe::before { background: conic-gradient(#FF3D71 var(--pct), #182030 0); }
-.ring-nt::before { background: conic-gradient(#64748B var(--pct), #182030 0); }
-.cert-pct { font-size: 1.5rem; font-weight: 900; color: #FFF; line-height: 1; }
-.cert-label { font-size: 0.55rem; color: #64748B; text-transform: uppercase; font-weight: 700; }
+.gauge-svg { width: 120px; height: 120px; transform: rotate(-90deg); }
+.gauge-bg { fill: none; stroke: #182030; stroke-width: 8; }
+.gauge-arc { fill: none; stroke-width: 8; stroke-linecap: round; transition: all 0.8s ease; }
+.gauge-val-box { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+.cert-pct { font-size: 1.7rem; font-weight: 900; color: #FFF; line-height: 1; }
+.cert-label { font-size: 0.58rem; color: #64748B; text-transform: uppercase; font-weight: 800; letter-spacing: 1px; margin-top: 2px; }
 
-.mg { display: grid; grid-template-columns: repeat(3,1fr); gap: 5px; margin-top: 8px; background: rgba(0,0,0,0.3); padding: 8px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.04); }
+/* Metrics Grid */
+.mg { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; margin-top: 10px; background: rgba(0,0,0,0.35); padding: 10px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.04); }
 .mb { text-align: center; }
-.ml { font-size: 0.62rem; color: #64748B; text-transform: uppercase; font-weight: 700; }
-.mv { font-size: 0.95rem; font-weight: 800; color: #FFF; margin-top: 1px; }
+.ml { font-size: 0.64rem; color: #64748B; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
+.mv { font-size: 1.05rem; font-weight: 900; color: #FFF; margin-top: 1px; }
 .vg { color: #00E676 !important; } .vr { color: #FF3D71 !important; }
 .vc { color: #00E5FF !important; } .vy { color: #FFB300 !important; }
 
-.fb-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; justify-content: center; }
-.fb { font-size: 0.65rem; padding: 4px 8px; border-radius: 8px; font-weight: 700; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); color: #94A3B8; }
+/* Multi-Agent Pill Badges */
+.fb-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; justify-content: center; }
+.fb { font-size: 0.68rem; padding: 4px 10px; border-radius: 10px; font-weight: 700; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); color: #94A3B8; }
 .fb-hi { border-color: rgba(0,230,118,0.35); color: #00E676; background: rgba(0,230,118,0.06); }
 .fb-lo { border-color: rgba(255,61,113,0.25); color: #FF3D71; background: rgba(255,61,113,0.04); }
 .fb-mid { border-color: rgba(255,179,0,0.25); color: #FFB300; background: rgba(255,179,0,0.04); }
 
-.trap-warn { margin-top: 8px; padding: 6px 10px; border-radius: 8px; background: rgba(255,179,0,0.08); border: 1px solid rgba(255,179,0,0.3); font-size: 0.72rem; color: #FFB300; font-weight: 600; }
+.trap-warn { margin-top: 10px; padding: 8px 12px; border-radius: 10px; background: rgba(255,179,0,0.08); border: 1px solid rgba(255,179,0,0.3); font-size: 0.75rem; color: #FFB300; font-weight: 600; }
 @keyframes pulse { 0%,100% { opacity: 0.8; transform: scale(0.95); } 50% { opacity: 1; transform: scale(1.1); } }
-.live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #00E676; box-shadow: 0 0 8px #00E676; animation: pulse 1.8s infinite; margin-right: 5px; }
-.sp { display: inline-block; font-size: 0.7rem; background: #111622; color: #00E5FF; padding: 2px 7px; border-radius: 10px; border: 1px solid #00E5FF; margin-left: 5px; font-weight: 700; }
+.live-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #00E676; box-shadow: 0 0 10px #00E676; animation: pulse 1.8s infinite; margin-right: 6px; }
+.sp { display: inline-block; font-size: 0.72rem; background: #111622; color: #00E5FF; padding: 3px 9px; border-radius: 10px; border: 1px solid #00E5FF; margin-left: 6px; font-weight: 700; }
 </style>
 """
 
@@ -748,16 +750,16 @@ st.markdown(DARK_CSS, unsafe_allow_html=True)
 hdr1, hdr2 = st.columns([2.5, 1.5])
 with hdr1:
     m_badge = (
-        '<span style="font-size:0.72rem;font-weight:700;background:rgba(0,230,118,0.1);color:#00E676;'
-        'padding:2px 7px;border-radius:10px;border:1px solid #00E676;margin-left:6px;">🟢 MARKET OPEN</span>'
+        '<span style="font-size:0.75rem;font-weight:700;background:rgba(0,230,118,0.1);color:#00E676;'
+        'padding:3px 9px;border-radius:10px;border:1px solid #00E676;margin-left:8px;">🟢 MARKET OPEN</span>'
         if is_nse_market_open() else
-        '<span style="font-size:0.72rem;font-weight:700;background:rgba(255,61,113,0.1);color:#FF3D71;'
-        'padding:2px 7px;border-radius:10px;border:1px solid #FF3D71;margin-left:6px;">🔴 MARKET CLOSED</span>'
+        '<span style="font-size:0.75rem;font-weight:700;background:rgba(255,61,113,0.1);color:#FF3D71;'
+        'padding:3px 9px;border-radius:10px;border:1px solid #FF3D71;margin-left:8px;">🔴 MARKET CLOSED</span>'
     )
     st.markdown(
         '<div style="display:flex;align-items:center;">'
         '<span class="live-dot"></span>'
-        '<span style="font-size:1.2rem;font-weight:900;color:#FFF;">ALGO RADAR</span>'
+        '<span style="font-size:1.3rem;font-weight:900;color:#FFF;letter-spacing:0.5px;">ALGO RADAR</span>'
         '<span class="sp">v5 LUX</span>'
         f'{m_badge}'
         '</div>',
@@ -765,7 +767,7 @@ with hdr1:
     )
 with hdr2:
     st.markdown(
-        f'<div style="text-align:right;padding-top:4px;font-size:0.7rem;color:#64748B;">'
+        f'<div style="text-align:right;padding-top:4px;font-size:0.72rem;color:#64748B;">'
         f'{datetime.now(timezone.utc).strftime("%H:%M UTC")}</div>',
         unsafe_allow_html=True,
     )
@@ -824,29 +826,29 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
         if pred.signal == "BUY_ATM_CE":
             hero_cls, badge_cls = "hero-ce", "badge-ce"
             badge_txt = "🟢 BUY ATM CE"
-            ring_cls, accent = "ring-ce", "#00E676"
+            accent = "#00E676"
         elif pred.signal == "BUY_ATM_PE":
             hero_cls, badge_cls = "hero-pe", "badge-pe"
             badge_txt = "🔴 BUY ATM PE"
-            ring_cls, accent = "ring-pe", "#FF3D71"
+            accent = "#FF3D71"
         else:
             hero_cls, badge_cls = "hero-nt", "badge-nt"
             badge_txt = "⚪ NO TRADE"
-            ring_cls, accent = "ring-nt", "#64748B"
+            accent = "#64748B"
 
         def _fb_cls(score: float) -> str:
             if score >= 62: return "fb fb-hi"
             elif score <= 40: return "fb fb-lo"
             return "fb fb-mid"
 
-        pct_deg = f"{pred.confidence * 3.6:.0f}deg"
+        dash_array = f"{(pred.confidence / 100) * 314:.1f} 314"
 
         card = textwrap.dedent(f"""
         <div class="hero-card {hero_cls}">
             <div class="hero-header">
                 <div>
                     <h2 class="sym-big">{symbol}</h2>
-                    <span style="font-size:0.8rem;color:#94A3B8;">
+                    <span style="font-size:0.82rem;color:#94A3B8;">
                         Spot: <b style="color:#FFF">₹{chain.spot:,.2f}</b> &nbsp;|&nbsp;
                         H: <b class="vg">₹{chain.day_high:,.0f}</b> &nbsp;
                         L: <b class="vr">₹{chain.day_low:,.0f}</b> &nbsp;|&nbsp;
@@ -856,12 +858,20 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
                 <div class="badge {badge_cls}">{badge_txt}</div>
             </div>
 
-            <!-- AI Certainty Ring -->
-            <div class="certainty-ring {ring_cls}" style="--pct: {pct_deg}">
-                <span class="cert-pct">{pred.confidence:.1f}%</span>
-                <span class="cert-label">AI Certainty</span>
+            <!-- SVG Certainty Gauge -->
+            <div class="gauge-container">
+                <div class="relative" style="width:120px;height:120px;">
+                    <svg class="gauge-svg" viewBox="0 0 120 120">
+                        <circle class="gauge-bg" cx="60" cy="60" r="50"/>
+                        <circle class="gauge-arc" cx="60" cy="60" r="50" stroke="{accent}" stroke-dasharray="{dash_array}"/>
+                    </svg>
+                    <div class="gauge-val-box">
+                        <span class="cert-pct">{pred.confidence:.1f}%</span>
+                        <span class="cert-label">AI Certainty</span>
+                    </div>
+                </div>
             </div>
-            <div style="text-align:center;font-size:0.7rem;color:{accent};font-weight:800;letter-spacing:1px;margin-bottom:4px;">
+            <div style="text-align:center;font-size:0.75rem;color:{accent};font-weight:800;letter-spacing:1px;margin-bottom:4px;">
                 {'🔥 ' + pred.conviction_level + ' CONVICTION' if pred.conviction_level in ('HIGH','VERY HIGH') else pred.conviction_level + ' CONVICTION'} — {pred.strategy_name.upper()}
             </div>
 
@@ -879,12 +889,12 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
                 <div class="mb"><div class="ml">Entry</div><div class="mv">₹{pred.entry_premium:.1f}</div></div>
                 <div class="mb"><div class="ml">Stop-Loss 12%</div><div class="mv vr">₹{pred.stop_loss:.1f}</div></div>
             </div>
-            <div class="mg" style="margin-top:4px;">
+            <div class="mg" style="margin-top:5px;">
                 <div class="mb"><div class="ml">Target (1:2)</div><div class="mv vg">₹{pred.target:.1f}</div></div>
                 <div class="mb"><div class="ml">PCR</div><div class="mv vy">{chain.pcr:.2f}</div></div>
                 <div class="mb"><div class="ml">Sentiment</div><div class="mv {'vg' if sent_score>0 else 'vr'}">{sent_score:+.2f}</div></div>
             </div>
-            <div class="mg" style="margin-top:4px;">
+            <div class="mg" style="margin-top:5px;">
                 <div class="mb"><div class="ml">ADX</div><div class="mv">{tech.adx:.1f}</div></div>
                 <div class="mb"><div class="ml">RSI</div><div class="mv {'vr' if tech.rsi>70 else 'vg' if tech.rsi<30 else ''}">{tech.rsi:.0f}</div></div>
                 <div class="mb"><div class="ml">Delta</div><div class="mv">{pred.delta_selected:.2f}</div></div>
@@ -897,7 +907,7 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
 
         # Candlestick Chart
         st.markdown(
-            "<p style='font-size:0.75rem;font-weight:700;color:#94A3B8;margin:0 0 2px;'>"
+            "<p style='font-size:0.78rem;font-weight:700;color:#94A3B8;margin:0 0 2px;'>"
             "5-MIN CANDLESTICK — VWAP · EMA 9/21 · SUPERTREND · ENTRY/SL/TGT · VOLUME</p>",
             unsafe_allow_html=True,
         )
@@ -914,10 +924,10 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
         # PCR Gauge & OI Bar Chart
         bc1, bc2 = st.columns([1, 1.6])
         with bc1:
-            st.markdown("<p style='font-size:0.7rem;font-weight:700;color:#94A3B8;margin:0;'>PCR GAUGE</p>", unsafe_allow_html=True)
+            st.markdown("<p style='font-size:0.72rem;font-weight:700;color:#94A3B8;margin:0;'>PCR GAUGE</p>", unsafe_allow_html=True)
             st.plotly_chart(build_pcr_gauge(chain.pcr), width="stretch", config={"displayModeBar": False})
         with bc2:
-            st.markdown("<p style='font-size:0.7rem;font-weight:700;color:#94A3B8;margin:0;'>STRIKE-WISE OI CHANGE</p>", unsafe_allow_html=True)
+            st.markdown("<p style='font-size:0.72rem;font-weight:700;color:#94A3B8;margin:0;'>STRIKE-WISE OI CHANGE</p>", unsafe_allow_html=True)
             st.plotly_chart(build_oi_chart(chain.df_chain, chain.atm_strike), width="stretch", config={"displayModeBar": False})
 
         # AI Rationale & Headlines
@@ -932,7 +942,7 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
 
 # Footer
 st.markdown(
-    f'<div style="text-align:center;padding:8px 0;color:#64748B;font-size:0.7rem;">'
+    f'<div style="text-align:center;padding:10px 0;color:#64748B;font-size:0.72rem;">'
     f'⚡ Algo Radar v5 LUX — Real-Time Signal Engine'
     f' | UTC: {datetime.now(timezone.utc).strftime("%H:%M:%S")}</div>',
     unsafe_allow_html=True,
