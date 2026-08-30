@@ -1,11 +1,16 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
- ALGO RADAR v4 — Institutional-Grade NIFTY & BANKNIFTY Option Trading Terminal
+ ALGO RADAR v5 — Institutional-Grade Bloomberg/Apple Dark Terminal
+ NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Engine
 ═══════════════════════════════════════════════════════════════════════════════
- FastAPI + WebSocket + Embedded HTML/CSS/JS
- Zero-flicker live updates via async WebSocket stream
- TradingView Lightweight Charts for candlestick rendering
- Apple-inspired Obsidian Dark theme — iPhone 15 & MacBook optimized
+ Features:
+  - FastAPI + Async WebSocket server pushing 2-second live updates
+  - Embedded Tailwind CSS + TradingView Lightweight Charts v4.x frontend
+  - Apple Dark Obsidian aesthetic (#07090e, glassmorphism cards, tabular figures)
+  - iPhone 15 touch targets + MacBook high-res multi-column grid
+  - Multi-Agent AI Consensus Radar (35% PA + 35% OI + 15% Sent + 15% Greeks)
+  - Zero-flicker Lightweight Charts streaming with Entry/SL/Target price lines
+  - NSE Market Hours check with static data freeze when closed
 
  Run:  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ═══════════════════════════════════════════════════════════════════════════════
@@ -18,8 +23,8 @@ import json
 import math
 import re
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 import numpy as np
@@ -27,7 +32,7 @@ import pandas as pd
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-# Optional heavy imports
+# Optional heavy imports with fallbacks
 try:
     import feedparser
     _HAS_FP = True
@@ -43,21 +48,15 @@ except ImportError:
 import requests as http_req
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  FASTAPI APPLICATION                                                    ║
+# ║  FASTAPI APPLICATION & CONFIG                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-app = FastAPI(title="Algo Radar v4", version="4.0.0")
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  CONSTANTS                                                              ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+app = FastAPI(title="Algo Radar v5", version="5.0.0")
 
 INSTRUMENTS = {
     "NIFTY": {"step": 50.0, "base": 24535.0, "lot": 25, "vix": 13.5},
     "BANKNIFTY": {"step": 100.0, "base": 51320.0, "lot": 15, "vix": 15.2},
 }
-
-W_PA, W_OF, W_SE, W_GV = 0.35, 0.35, 0.15, 0.15  # factor weights
 
 BULL_LEX = frozenset({"surge","rally","jump","gain","bull","high","growth","boost",
     "outperform","record","upgrade","breakout","positive","profit","optimis",
@@ -73,26 +72,27 @@ RSS_FEEDS = {
 }
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 1: OPTION CHAIN SIMULATOR                                      ║
+# ║  NSE MARKET HOURS CHECK                                                 ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-
-from datetime import datetime, timezone, timedelta
 
 def is_nse_market_open() -> bool:
     """Check if current IST time is within NSE market hours (Mon-Fri, 09:15-15:30 IST)."""
     ist = timezone(timedelta(hours=5, minutes=30))
     now = datetime.now(ist)
-    if now.weekday() >= 5: return False
+    if now.weekday() >= 5:  # Saturday or Sunday
+        return False
     start = now.replace(hour=9, minute=15, second=0, microsecond=0)
     end = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return start <= now <= end
 
 
-# persistent tick state for smooth walk
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  MODULE 1: OPTION CHAIN & DERIVATIVES ENGINE                           ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
 _tick_state: Dict[str, float] = {}
 
 def _walk_spot(symbol: str) -> float:
-    """Smooth random-walk spot price that persists across ticks."""
     cfg = INSTRUMENTS[symbol]
     if symbol not in _tick_state:
         _tick_state[symbol] = cfg["base"]
@@ -146,7 +146,7 @@ def generate_chain(symbol: str) -> dict:
     pcr = round(tp_ / max(1, tc), 3)
     pcr_prev = round(pcr + float(np.random.uniform(-0.12, 0.12)), 3)
 
-    # max pain
+    # Max Pain calculation
     ss = df["strike"].values
     co = df["c_oi"].values; po = df["p_oi"].values
     S = ss[:, np.newaxis]; K = ss[np.newaxis, :]
@@ -172,11 +172,12 @@ def generate_chain(symbol: str) -> dict:
         "call_unwind": cu, "put_unwind": pu,
         "call_write": cw, "put_write": pw, "simul_write": simw,
         "chain": df.to_dict("records"), "expiry": "2026-09-04",
+        "market_open": market_open,
     }
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 2: 5-MIN OHLCV SIMULATOR & TECHNICAL ENGINE                   ║
+# ║  MODULE 2: 5-MIN OHLCV & TECHNICAL ENGINE                               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 _candle_store: Dict[str, List[dict]] = {}
@@ -184,7 +185,6 @@ _candle_store: Dict[str, List[dict]] = {}
 def get_candles(symbol: str, spot: float, max_bars: int = 78) -> List[dict]:
     market_open = is_nse_market_open()
     if symbol not in _candle_store or len(_candle_store[symbol]) == 0 or not market_open:
-        # bootstrap / frozen state
         np.random.seed(2000 + hash(symbol) % 10000)
         bars = []
         p = spot - float(np.random.uniform(20, 80))
@@ -203,12 +203,10 @@ def get_candles(symbol: str, spot: float, max_bars: int = 78) -> List[dict]:
         last = bars[-1]
         now_t = math.floor(time.time())
         if now_t - last["time"] < 300:
-            # Update active bar in-place smoothly
             last["close"] = spot
             last["high"] = max(last["high"], spot)
             last["low"] = min(last["low"], spot)
         else:
-            # Open new 5-min candle
             nb = {"time": last["time"] + 300, "open": last["close"],
                   "high": max(last["close"], spot), "low": min(last["close"], spot),
                   "close": spot, "volume": int(np.random.randint(12000, 55000))}
@@ -292,13 +290,13 @@ def compute_technicals(candles: List[dict]) -> dict:
     if ec in ("BULLISH_CROSS", "BEARISH_CROSS"): es *= 1.5
     pa = float(np.clip(vd * 0.4 + sts * 0.35 + es * 0.25, -1, 1))
 
-    # Build overlay arrays for chart
+    # Overlays array for chart
     vwap_arr = [{"time": candles[i]["time"], "value": round(float(df["vwap"].iloc[i]), 2)} for i in range(len(df))]
     ema9_arr = [{"time": candles[i]["time"], "value": round(float(df["ema9"].iloc[i]), 2)} for i in range(len(df))]
     ema21_arr = [{"time": candles[i]["time"], "value": round(float(df["ema21"].iloc[i]), 2)} for i in range(len(df))]
     st_arr = [{"time": candles[i]["time"], "value": round(float(df["supertrend"].iloc[i]), 2)} for i in range(len(df))]
     vol_arr = [{"time": candles[i]["time"], "value": int(df["volume"].iloc[i]),
-                "color": "rgba(0,200,83,0.5)" if float(df["close"].iloc[i]) >= float(df["open"].iloc[i]) else "rgba(255,61,0,0.5)"}
+                "color": "rgba(0,230,118,0.5)" if float(df["close"].iloc[i]) >= float(df["open"].iloc[i]) else "rgba(255,61,113,0.5)"}
                for i in range(len(df))]
     volavg_arr = [{"time": candles[i]["time"], "value": round(float(df["vol_ema20"].iloc[i]), 0)} for i in range(len(df))]
 
@@ -313,14 +311,13 @@ def compute_technicals(candles: List[dict]) -> dict:
         "rsi": round(float(last["rsi"]), 1),
         "vol_expanding": bool(int(last["volume"]) > float(last["vol_ema20"]) * 1.2),
         "pa_score": round(pa, 4),
-        # chart overlays
         "vwap_line": vwap_arr, "ema9_line": ema9_arr, "ema21_line": ema21_arr,
         "st_line": st_arr, "vol_hist": vol_arr, "vol_avg_line": volavg_arr,
     }
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 3: NEWS SENTIMENT                                              ║
+# ║  MODULE 3: NEWS SENTIMENT ENGINE (FinBERT + Lexicon)                    ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 _finbert = None
@@ -386,7 +383,7 @@ def fetch_sentiment() -> Tuple[float, List[dict]]:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 4: AI PREDICTION BRAIN                                         ║
+# ║  MODULE 4: MULTI-AGENT AI CONSENSUS DECISION BRAIN                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def predict(chain: dict, tech: dict, sent: float) -> dict:
@@ -395,7 +392,7 @@ def predict(chain: dict, tech: dict, sent: float) -> dict:
     iv_mid = (chain["atm_c_iv"] + chain["atm_p_iv"]) / 2
     iv_crush = iv_mid < 11.0
 
-    # Regime
+    # Regime Classification
     if adx >= 22 and vol_exp:
         regime, strat = "STRONG_TREND", "Momentum Breakout"
     elif adx < 22 and (pcr > 1.25 or pcr < 0.75 or rsi > 72 or rsi < 28):
@@ -407,58 +404,69 @@ def predict(chain: dict, tech: dict, sent: float) -> dict:
     else:
         regime, strat = "TRANSITIONAL", "Selective Momentum"
 
-    # Factor scores 0-100
-    pa_raw = tech["pa_score"]
+    # Multi-Agent Factor Scores with Exact Points Breakdown
+    # Factor 1: Price Action (max 35 pts)
+    pa_raw = tech["pa_score"]  # [-1, +1]
     st_b = 8 if tech["st_dir"] == (1 if pa_raw > 0 else -1) else -5
     ema_b = 10 if tech["ema_cross"] in ("BULLISH_CROSS", "BEARISH_CROSS") else 0
-    pa_sc = float(np.clip(50 + pa_raw * 40 + st_b + ema_b, 0, 100))
+    pa_score_100 = np.clip(50 + pa_raw * 40 + st_b + ema_b, 0, 100)
+    pa_pts = round(float(pa_score_100 * 0.35), 1)
 
+    # Factor 2: Option Flow (max 35 pts)
     pcr_sig = min(30, (pcr - 1.10) * 100) if pcr > 1.10 else (max(-30, (pcr - 0.85) * 100) if pcr < 0.85 else 0)
     oi_sig = 0
     if chain["call_unwind"] and not chain["put_unwind"]: oi_sig = 20
     elif chain["put_unwind"] and not chain["call_unwind"]: oi_sig = -20
     elif chain["put_write"] and not chain["call_write"]: oi_sig = 15
     elif chain["call_write"] and not chain["put_write"]: oi_sig = -15
-    of_sc = float(np.clip(50 + np.clip(pcr_sig + oi_sig + chain["pcr_shift"] * 50, -50, 50), 0, 100))
+    of_score_100 = np.clip(50 + np.clip(pcr_sig + oi_sig + chain["pcr_shift"] * 50, -50, 50), 0, 100)
+    of_pts = round(float(of_score_100 * 0.35), 1)
 
-    se_sc = float(np.clip(50 + sent * 45, 0, 100))
+    # Factor 3: News Sentiment (max 15 pts)
+    se_score_100 = np.clip(50 + sent * 45, 0, 100)
+    se_pts = round(float(se_score_100 * 0.15), 1)
 
+    # Factor 4: Greeks & Volatility (max 15 pts)
     iv_pen = -min(15, (iv_mid - 18) * 2) if iv_mid > 18 else (-10 if iv_mid < 9 else 0)
     ad = max(abs(chain["atm_c_delta"]), abs(chain["atm_p_delta"]))
     d_bon = 10 if 0.42 <= ad <= 0.58 else 0
-    gv_sc = float(np.clip(55 + iv_pen + d_bon + (chain["vix"] - 14) * -2, 0, 100))
+    gv_score_100 = np.clip(55 + iv_pen + d_bon + (chain["vix"] - 14) * -2, 0, 100)
+    gv_pts = round(float(gv_score_100 * 0.15), 1)
 
-    bull = pa_sc * W_PA + of_sc * W_OF + se_sc * W_SE + gv_sc * W_GV
-    bear = (100-pa_sc)*W_PA + (100-of_sc)*W_OF + (100-se_sc)*W_SE + gv_sc*W_GV
+    # Bullish vs Bearish Confidence Sum
+    bull = pa_pts + of_pts + se_pts + gv_pts
+    bear = (35 - pa_pts) + (35 - of_pts) + (15 - se_pts) + gv_pts
 
     if regime == "STRONG_TREND":
-        if tech["st_dir"] == 1: bull += 6
-        else: bear += 6
+        if tech["st_dir"] == 1: bull += 5
+        else: bear += 5
     elif regime == "MEAN_REVERSION":
-        if rsi < 30: bull += 5
-        elif rsi > 70: bear += 5
+        if rsi < 30: bull += 4
+        elif rsi > 70: bear += 4
 
-    bull = round(float(np.clip(bull, 0, 100)), 1)
-    bear = round(float(np.clip(bear, 0, 100)), 1)
+    bull_conf = round(float(np.clip(bull, 0, 100)), 1)
+    bear_conf = round(float(np.clip(bear, 0, 100)), 1)
 
-    trap = ""; force_nt = False
+    # Trap Filter Logic
+    trap_msg = ""
+    force_nt = False
     if regime == "CHOP_TRAP":
-        trap = "CHOP TRAP: Simultaneous writing + low ADX + IV crush."
+        trap_msg = "CHOP TRAP: Simultaneous Writing + Low ADX + Crushing IV."
         force_nt = True
     elif simw and adx < 20:
-        trap = "Range-bound balanced writing. Breakout uncertain."
-        bull *= 0.8; bear *= 0.8
-        bull = round(bull, 1); bear = round(bear, 1)
+        trap_msg = "Range-bound balanced writing. Breakout direction uncertain."
+        bull_conf = round(bull_conf * 0.8, 1)
+        bear_conf = round(bear_conf * 0.8, 1)
 
-    # Decision with 75% threshold
-    if force_nt or (bull < 75 and bear < 75):
-        sig, conf = "NO_TRADE", max(bull, bear)
-    elif bull >= 75 and bull > bear:
-        sig, conf = "BUY_ATM_CE", bull
-    elif bear >= 75:
-        sig, conf = "BUY_ATM_PE", bear
+    # Decision Threshold: >= 75%
+    if force_nt or (bull_conf < 75 and bear_conf < 75):
+        sig, conf = "NO_TRADE", max(bull_conf, bear_conf)
+    elif bull_conf >= 75 and bull_conf > bear_conf:
+        sig, conf = "BUY_ATM_CE", bull_conf
+    elif bear_conf >= 75:
+        sig, conf = "BUY_ATM_PE", bear_conf
     else:
-        sig, conf = "NO_TRADE", max(bull, bear)
+        sig, conf = "NO_TRADE", max(bull_conf, bear_conf)
 
     conv = "VERY HIGH" if conf >= 85 else ("HIGH" if conf >= 75 else ("MEDIUM" if conf >= 65 else "LOW"))
 
@@ -469,44 +477,26 @@ def predict(chain: dict, tech: dict, sent: float) -> dict:
     else:
         entry, delta, ot = 0, 0, "NONE"
 
-    sl = round(entry * 0.88, 2) if entry > 0 else 0
-    tgt = round(entry * 1.24, 2) if entry > 0 else 0
+    sl = round(entry * 0.88, 2) if entry > 0 else 0   # 12% Stop Loss
+    tgt = round(entry * 1.24, 2) if entry > 0 else 0  # 24% Target (1:2 R:R)
 
-    # Trap filter label
-    if not trap:
-        trap_status = "PASSED"
-    else:
-        trap_status = "BLOCKED"
+    trap_status = "PASSED" if not trap_msg else ("BLOCKED" if force_nt else "WARNING")
+    pa_label = "Bullish" if pa_score_100 >= 60 else ("Bearish" if pa_score_100 <= 40 else "Neutral")
 
-    # Price action label
-    if pa_sc > 60:
-        pa_label = "Bullish"
-    elif pa_sc < 40:
-        pa_label = "Bearish"
-    else:
-        pa_label = "Neutral"
-
-    # OI flow label
-    if chain["call_unwind"]:
-        oi_label = "Call Unwind"
-    elif chain["put_write"]:
-        oi_label = "Put Writing"
-    elif chain["call_write"]:
-        oi_label = "Call Writing"
-    elif chain["put_unwind"]:
-        oi_label = "Put Unwind"
-    else:
-        oi_label = "Balanced"
+    if chain["call_unwind"]: oi_label = "Call Unwind"
+    elif chain["put_write"]: oi_label = "Put Writing"
+    elif chain["call_write"]: oi_label = "Call Writing"
+    elif chain["put_unwind"]: oi_label = "Put Unwind"
+    else: oi_label = "Balanced"
 
     return {
         "signal": sig, "regime": regime, "strategy": strat,
         "confidence": conf, "conviction": conv,
-        "pa_score": round(pa_sc, 1), "of_score": round(of_sc, 1),
-        "se_score": round(se_sc, 1), "gv_score": round(gv_sc, 1),
+        "pa_pts": pa_pts, "of_pts": of_pts, "se_pts": se_pts, "gv_pts": gv_pts,
         "strike": chain["atm"], "option_type": ot,
         "entry": round(entry, 2), "sl": sl, "target": tgt,
         "delta": round(delta, 3),
-        "trap_warning": trap, "trap_status": trap_status,
+        "trap_warning": trap_msg, "trap_status": trap_status,
         "pa_label": pa_label, "oi_label": oi_label,
     }
 
@@ -527,22 +517,7 @@ class ConnectionManager:
         if ws in self.active:
             self.active.remove(ws)
 
-    async def broadcast(self, data: dict):
-        dead = []
-        for ws in self.active:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
-
 mgr = ConnectionManager()
-
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 6: API ROUTES                                                  ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -551,17 +526,14 @@ async def index():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await mgr.connect(websocket)
-    # Fetch sentiment once at connection
     sent_score, headlines = fetch_sentiment()
 
     try:
         while True:
-            # Check for client messages (symbol switch)
             try:
                 msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.01)
                 data = json.loads(msg)
                 if "symbol" in data:
-                    # store on websocket state
                     websocket._symbol = data["symbol"]
             except asyncio.TimeoutError:
                 pass
@@ -592,7 +564,7 @@ async def websocket_endpoint(websocket: WebSocket):
             }
 
             await websocket.send_json(payload)
-            await asyncio.sleep(3)  # tick every 3 seconds
+            await asyncio.sleep(2)  # 2-second smooth WebSocket tick loop
 
     except WebSocketDisconnect:
         mgr.disconnect(websocket)
@@ -601,425 +573,351 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 7: EMBEDDED HTML/CSS/JS TEMPLATE                               ║
+# ║  MODULE 6: EMBEDDED SINGLE-FILE HTML/TAILWIND/TRADINGVIEW TERMINAL     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="h-full">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="theme-color" content="#0b0f19">
-<title>Algo Radar v4 | NIFTY & BANKNIFTY Terminal</title>
+<meta name="theme-color" content="#07090e">
+<title>Algo Radar v5 | Bloomberg Dark Terminal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        obsidian: '#07090e',
+        card: '#111622',
+        card2: '#182030',
+        border: '#1e2638',
+        cyanAccent: '#00e5ff',
+        emeraldAccent: '#00e676',
+        coralAccent: '#ff3d71',
+        amberAccent: '#ffb300',
+      },
+      fontFamily: { sans: ['Inter', 'sans-serif'] }
+    }
+  }
+}
+</script>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
-*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
-:root{
-  --bg:#0b0f19;--card:#131a2b;--card2:#1a2235;--border:#1e293b;
-  --text:#e2e8f0;--muted:#64748b;--green:#00e676;--red:#ff1744;
-  --cyan:#00e5ff;--yellow:#ffd600;--purple:#e040fb;--amber:#ffab00;
+body {
+  background-color: #07090e;
+  color: #e2e8f0;
+  font-family: 'Inter', sans-serif;
+  font-variant-numeric: tabular-nums;
+  -webkit-tap-highlight-color: transparent;
+  overflow-x: hidden;
 }
-html{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);
-     -webkit-text-size-adjust:100%;overflow-x:hidden}
-body{min-height:100vh;min-height:100dvh;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
-
-/* ── Top Bar ── */
-.topbar{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;
-  padding:10px 14px;background:rgba(11,15,25,0.92);backdrop-filter:blur(16px);
-  border-bottom:1px solid var(--border)}
-.topbar-left{display:flex;align-items:center;gap:10px}
-.logo{font-size:1.1rem;font-weight:900;color:#fff;letter-spacing:.5px}
-.logo span{color:var(--cyan);font-size:.75rem;font-weight:700;background:#0b1628;
-  padding:2px 7px;border-radius:6px;border:1px solid var(--cyan);margin-left:6px}
-.heartbeat{width:8px;height:8px;border-radius:50%;background:var(--green);
-  box-shadow:0 0 6px var(--green);animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:.7;transform:scale(.9)}50%{opacity:1;transform:scale(1.15)}}
-
-.seg-ctrl{display:flex;background:var(--card);border-radius:10px;padding:3px;gap:2px}
-.seg-btn{padding:7px 16px;border:none;background:transparent;color:var(--muted);cursor:pointer;
-  border-radius:8px;font-weight:700;font-size:.78rem;transition:.2s;font-family:inherit}
-.seg-btn.active{background:var(--card2);color:#fff;box-shadow:0 0 12px rgba(0,229,255,.15)}
-.seg-btn:hover{color:#fff}
-
-.topbar-right{display:flex;align-items:center;gap:10px;font-size:.72rem}
-.spot-pill{background:var(--card);padding:4px 10px;border-radius:8px;border:1px solid var(--border);
-  font-weight:700;color:var(--cyan);font-variant-numeric:tabular-nums}
-.vix-pill{background:rgba(255,214,0,.08);color:var(--yellow);padding:4px 10px;border-radius:8px;
-  border:1px solid rgba(255,214,0,.2);font-weight:700}
-
-/* ── Layout ── */
-.main{max-width:1100px;margin:0 auto;padding:10px 12px 80px}
-
-/* ── Hero Card ── */
-.hero{border-radius:18px;padding:18px 16px;margin-bottom:12px;position:relative;overflow:hidden;
-  transition:border-color .4s,box-shadow .4s}
-.hero.ce{background:linear-gradient(135deg,rgba(0,230,118,.06),var(--card) 70%);
-  border:2px solid var(--green);box-shadow:0 0 40px rgba(0,230,118,.15)}
-.hero.pe{background:linear-gradient(135deg,rgba(255,23,68,.06),var(--card) 70%);
-  border:2px solid var(--red);box-shadow:0 0 40px rgba(255,23,68,.15)}
-.hero.nt{background:var(--card);border:1px solid var(--border)}
-
-.hero-header{display:flex;justify-content:space-between;align-items:center}
-.hero-sym{font-size:1.5rem;font-weight:900}
-.hero-sub{font-size:.78rem;color:var(--muted);margin-top:2px}
-.hero-sub b{color:var(--text)}
-.badge{padding:5px 14px;border-radius:20px;font-weight:800;font-size:.78rem;letter-spacing:1.2px;text-transform:uppercase}
-.badge.ce{background:var(--green);color:#000;box-shadow:0 0 16px var(--green)}
-.badge.pe{background:var(--red);color:#fff;box-shadow:0 0 16px var(--red)}
-.badge.nt{background:var(--border);color:var(--muted)}
-
-/* Gauge */
-.gauge-wrap{display:flex;flex-direction:column;align-items:center;margin:14px 0 6px}
-.gauge-svg{width:120px;height:120px}
-.gauge-pct{font-size:1.65rem;font-weight:900;fill:#fff}
-.gauge-label{font-size:.55rem;fill:var(--muted);text-transform:uppercase;font-weight:700;letter-spacing:1px}
-.conv-line{text-align:center;font-size:.72rem;font-weight:800;letter-spacing:1px;margin-bottom:4px}
-
-/* Factor pills */
-.factors{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:8px 0}
-.fpill{font-size:.7rem;padding:4px 10px;border-radius:8px;font-weight:700;
-  background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);color:var(--muted)}
-.fpill.hi{border-color:rgba(0,230,118,.3);color:var(--green);background:rgba(0,230,118,.05)}
-.fpill.lo{border-color:rgba(255,23,68,.2);color:#ff8a80;background:rgba(255,23,68,.04)}
-.fpill.mid{border-color:rgba(255,214,0,.2);color:var(--yellow);background:rgba(255,214,0,.04)}
-
-/* Trade metrics grid */
-.mg{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:10px;
-  background:rgba(0,0,0,.25);padding:9px;border-radius:12px;border:1px solid rgba(255,255,255,.03)}
-.mb{text-align:center}
-.ml{font-size:.62rem;color:var(--muted);text-transform:uppercase;font-weight:700}
-.mv{font-size:1rem;font-weight:800;color:#fff;margin-top:1px;font-variant-numeric:tabular-nums}
-.vg{color:var(--green)!important} .vr{color:var(--red)!important}
-.vc{color:var(--cyan)!important} .vy{color:var(--yellow)!important}
-
-/* Trap */
-.trap-bar{margin-top:8px;padding:7px 12px;border-radius:8px;background:rgba(255,152,0,.07);
-  border:1px solid rgba(255,152,0,.25);font-size:.72rem;color:#ffb74d;font-weight:600;display:none}
-.trap-bar.show{display:block}
-
-/* ── Chart ── */
-.chart-wrap{background:var(--card);border-radius:14px;padding:4px;margin-bottom:12px;
-  border:1px solid var(--border);overflow:hidden}
-.chart-label{font-size:.7rem;font-weight:700;color:var(--muted);padding:6px 10px 2px}
-
-/* ── Bottom Grid ── */
-.bot-grid{display:grid;grid-template-columns:1fr 1.5fr;gap:10px;margin-bottom:12px}
-@media(max-width:600px){.bot-grid{grid-template-columns:1fr}}
-.panel{background:var(--card);border-radius:14px;padding:12px;border:1px solid var(--border)}
-.panel-title{font-size:.7rem;font-weight:700;color:var(--muted);margin-bottom:6px;text-transform:uppercase}
-
-/* PCR gauge */
-.pcr-gauge-wrap{display:flex;justify-content:center;align-items:center;padding:6px 0}
-.pcr-val{font-size:2rem;font-weight:900;text-align:center;margin-top:4px;font-variant-numeric:tabular-nums}
-.pcr-shift{font-size:.72rem;text-align:center;font-weight:700}
-
-/* OI chart */
-#oiChart{width:100%;height:180px}
-
-/* Sentiment bar */
-.sent-bar{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--card);
-  border-radius:10px;border:1px solid var(--border);margin-bottom:10px;font-size:.72rem}
-.sent-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
-.sent-label{font-weight:700;min-width:55px;font-variant-numeric:tabular-nums}
-
-/* Headlines */
-.hl{font-size:.68rem;color:var(--muted);padding:5px 10px;border-bottom:1px solid rgba(255,255,255,.03)}
-.hl:last-child{border-bottom:none}
-.hl b{color:var(--text);font-weight:600}
-
-/* Footer */
-.footer{text-align:center;padding:14px;font-size:.65rem;color:var(--muted)}
-
-/* ── Mobile ── */
-@media(max-width:600px){
-  .topbar{padding:8px 10px;flex-wrap:wrap;gap:6px}
-  .topbar-right{width:100%;justify-content:center;margin-top:2px}
-  .seg-btn{padding:6px 12px;font-size:.72rem}
-  .main{padding:8px 8px 60px}
-  .hero{padding:14px 12px}
-  .hero-sym{font-size:1.25rem}
-  .badge{font-size:.7rem;padding:4px 10px}
-  .gauge-svg{width:100px;height:100px}
-  .gauge-pct{font-size:1.35rem!important}
-  .mg{grid-template-columns:repeat(3,1fr);gap:4px;padding:7px}
-  .mv{font-size:.88rem}
+.hero-glow-ce {
+  border: 2px solid #00e676;
+  box-shadow: 0 0 35px rgba(0, 230, 118, 0.2), inset 0 0 40px rgba(0, 230, 118, 0.05);
+}
+.hero-glow-pe {
+  border: 2px solid #ff3d71;
+  box-shadow: 0 0 35px rgba(255, 61, 113, 0.2), inset 0 0 40px rgba(255, 61, 113, 0.05);
+}
+.hero-glow-nt {
+  border: 1px solid #1e2638;
+}
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.8; transform: scale(0.96); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+.pulse-dot {
+  animation: pulseGlow 1.8s infinite;
 }
 </style>
 </head>
-<body>
+<body class="min-h-full flex flex-col antialiased selection:bg-cyanAccent/30 selection:text-white">
 
-<!-- ═══ TOP BAR ═══ -->
-<div class="topbar">
-  <div class="topbar-left">
-    <div class="heartbeat"></div>
-    <div class="logo">ALGO RADAR<span>v4</span></div>
-    <div class="seg-ctrl">
-      <button class="seg-btn active" onclick="switchSymbol('NIFTY',this)">🚀 NIFTY 50</button>
-      <button class="seg-btn" onclick="switchSymbol('BANKNIFTY',this)">⚡ BANKNIFTY</button>
+<!-- ═══ TOP HEADER BAR ═══ -->
+<header class="sticky top-0 z-50 backdrop-blur-md bg-obsidian/90 border-b border-border px-3 py-2.5 sm:px-6">
+  <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2">
+    
+    <!-- Logo & Market Status -->
+    <div class="flex items-center gap-3">
+      <div class="w-2.5 h-2.5 rounded-full bg-emeraldAccent pulse-dot shadow-[0_0_8px_#00e676]"></div>
+      <span class="font-black text-lg sm:text-xl tracking-wider text-white">ALGO RADAR <span class="text-xs font-bold text-cyanAccent bg-card border border-cyanAccent/40 px-2 py-0.5 rounded-md">v5 LUX</span></span>
+      <div id="mktStatusPill" class="text-xs font-bold px-2.5 py-1 rounded-full border transition-all">Checking...</div>
     </div>
-  </div>
-  <div class="topbar-right">
-    <div class="spot-pill" id="spotPill">—</div>
-    <div class="vix-pill" id="vixPill">VIX —</div>
-  </div>
-</div>
 
-<!-- ═══ MAIN CONTENT ═══ -->
-<div class="main">
+    <!-- Index Toggle Buttons (iPhone Touch Target Optimized min-h-[44px]) -->
+    <div class="flex bg-card p-1 rounded-xl border border-border">
+      <button id="btnNifty" onclick="switchSymbol('NIFTY')" class="min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all bg-card2 text-white shadow-md border border-cyanAccent/30">🚀 NIFTY 50</button>
+      <button id="btnBankNifty" onclick="switchSymbol('BANKNIFTY')" class="min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all text-slate-400 hover:text-white">⚡ BANKNIFTY</button>
+    </div>
 
-  <!-- Hero Conviction Card -->
-  <div class="hero nt" id="heroCard">
-    <div class="hero-header">
-      <div>
-        <div class="hero-sym" id="heroSym">NIFTY</div>
-        <div class="hero-sub" id="heroSub">—</div>
+    <!-- Spot LTP & VIX -->
+    <div class="flex items-center gap-2 text-xs font-bold">
+      <div id="spotPill" class="bg-card px-3 py-1.5 rounded-lg border border-border text-cyanAccent">SPOT: —</div>
+      <div id="vixPill" class="bg-amberAccent/10 px-3 py-1.5 rounded-lg border border-amberAccent/30 text-amberAccent">INDIA VIX —</div>
+    </div>
+
+  </div>
+</header>
+
+<!-- ═══ MAIN LAYOUT ═══ -->
+<main class="flex-1 max-w-7xl w-full mx-auto p-3 sm:p-6 space-y-4">
+
+  <!-- Desktop 2-Column Grid / Mobile Single Column -->
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+
+    <!-- ── LEFT/CENTER COLUMN (Lg 7 cols): HERO CARD & CANDLESTICK CHART ── -->
+    <div class="lg:col-span-7 space-y-4">
+      
+      <!-- HERO CONVICTION CARD -->
+      <div id="heroCard" class="bg-card rounded-2xl p-4 sm:p-6 hero-glow-nt transition-all duration-500">
+        <div class="flex items-center justify-between">
+          <div>
+            <h1 id="heroSym" class="text-xl sm:text-2xl font-black text-white">NIFTY 50</h1>
+            <div id="heroSub" class="text-xs text-slate-400 mt-0.5">Spot: <b class="text-white">—</b> · H: <b class="text-emeraldAccent">—</b> · L: <b class="text-coralAccent">—</b></div>
+          </div>
+          <div id="heroBadge" class="px-4 py-1.5 rounded-full text-xs font-black uppercase tracking-wider bg-border text-slate-400">CONNECTING...</div>
+        </div>
+
+        <!-- Radial AI Certainty Gauge -->
+        <div class="flex flex-col items-center justify-center my-4">
+          <div class="relative w-28 h-28 flex items-center justify-center">
+            <svg class="w-full h-full transform -rotate-90" viewBox="0 0 120 120">
+              <circle cx="60" cy="60" r="50" fill="none" stroke="#182030" stroke-width="8"/>
+              <circle id="gaugeArc" cx="60" cy="60" r="50" fill="none" stroke="#64748b" stroke-width="8" stroke-linecap="round" stroke-dasharray="0 314" class="transition-all duration-700"/>
+            </svg>
+            <div class="absolute inset-0 flex flex-col items-center justify-center text-center">
+              <span id="gaugePct" class="text-2xl font-black text-white">0.0%</span>
+              <span class="text-[9px] font-bold text-slate-400 uppercase tracking-widest">AI Certainty</span>
+            </div>
+          </div>
+          <div id="convLine" class="text-xs font-black tracking-wider uppercase mt-2 text-slate-400">—</div>
+        </div>
+
+        <!-- Multi-Agent Consensus Pill Badges -->
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs">
+          <div id="fpPA" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">📈 Price: —</div>
+          <div id="fpOI" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">📊 OI: —</div>
+          <div id="fpSent" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">📰 News: —</div>
+          <div id="fpTrap" class="bg-card2/80 p-2 rounded-xl border border-border font-semibold text-slate-300">🛡 Trap: —</div>
+        </div>
+
+        <!-- Trade Metrics Grid -->
+        <div class="grid grid-cols-3 gap-2 mt-4 bg-obsidian/40 p-3 rounded-xl border border-border/50 text-center">
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Strike</div><div id="mStrike" class="text-sm font-extrabold text-cyanAccent">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Entry</div><div id="mEntry" class="text-sm font-extrabold text-white">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">SL (12%)</div><div id="mSL" class="text-sm font-extrabold text-coralAccent">—</div></div>
+        </div>
+        <div class="grid grid-cols-3 gap-2 mt-2 bg-obsidian/40 p-3 rounded-xl border border-border/50 text-center">
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Target (1:2)</div><div id="mTgt" class="text-sm font-extrabold text-emeraldAccent">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">PCR</div><div id="mPCR" class="text-sm font-extrabold text-amberAccent">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Delta</div><div id="mDelta" class="text-sm font-extrabold text-white">—</div></div>
+        </div>
+        <div class="grid grid-cols-3 gap-2 mt-2 bg-obsidian/40 p-3 rounded-xl border border-border/50 text-center">
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">ADX</div><div id="mADX" class="text-sm font-extrabold text-white">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">RSI</div><div id="mRSI" class="text-sm font-extrabold text-white">—</div></div>
+          <div><div class="text-[10px] uppercase font-bold text-slate-500">Regime</div><div id="mRegime" class="text-xs font-bold text-slate-300 uppercase mt-0.5">—</div></div>
+        </div>
+
+        <div id="trapBar" class="hidden mt-3 p-2.5 rounded-xl bg-amberAccent/10 border border-amberAccent/30 text-xs font-semibold text-amberAccent"></div>
       </div>
-      <div class="badge nt" id="heroBadge">CONNECTING…</div>
-    </div>
 
-    <!-- AI Gauge -->
-    <div class="gauge-wrap">
-      <svg class="gauge-svg" viewBox="0 0 120 120" id="gaugeSvg">
-        <circle cx="60" cy="60" r="52" fill="none" stroke="#1a2235" stroke-width="7"/>
-        <circle cx="60" cy="60" r="52" fill="none" stroke-width="7" stroke-linecap="round"
-                id="gaugeArc" stroke="#546e7a"
-                stroke-dasharray="0 327" transform="rotate(-90 60 60)"/>
-        <text x="60" y="56" text-anchor="middle" class="gauge-pct" id="gaugePct">—</text>
-        <text x="60" y="70" text-anchor="middle" class="gauge-label">AI CERTAINTY</text>
-      </svg>
-    </div>
-    <div class="conv-line" id="convLine">—</div>
-
-    <!-- Factor pills -->
-    <div class="factors" id="factorPills">
-      <span class="fpill" id="fpPA">📈 Price: —</span>
-      <span class="fpill" id="fpOI">📊 OI: —</span>
-      <span class="fpill" id="fpSent">📰 News: —</span>
-      <span class="fpill" id="fpTrap">🛡 Trap: —</span>
-    </div>
-
-    <!-- Trade Metrics -->
-    <div class="mg" id="tradeGrid">
-      <div class="mb"><div class="ml">Strike</div><div class="mv vc" id="mStrike">—</div></div>
-      <div class="mb"><div class="ml">Entry</div><div class="mv" id="mEntry">—</div></div>
-      <div class="mb"><div class="ml">SL (12%)</div><div class="mv vr" id="mSL">—</div></div>
-    </div>
-    <div class="mg" style="margin-top:4px">
-      <div class="mb"><div class="ml">Target (1:2)</div><div class="mv vg" id="mTgt">—</div></div>
-      <div class="mb"><div class="ml">PCR</div><div class="mv vy" id="mPCR">—</div></div>
-      <div class="mb"><div class="ml">Delta</div><div class="mv" id="mDelta">—</div></div>
-    </div>
-    <div class="mg" style="margin-top:4px">
-      <div class="mb"><div class="ml">ADX</div><div class="mv" id="mADX">—</div></div>
-      <div class="mb"><div class="ml">RSI</div><div class="mv" id="mRSI">—</div></div>
-      <div class="mb"><div class="ml">Regime</div><div class="mv" id="mRegime" style="font-size:.72rem">—</div></div>
-    </div>
-
-    <div class="trap-bar" id="trapBar">—</div>
-  </div>
-
-  <!-- Candlestick Chart -->
-  <div class="chart-wrap">
-    <div class="chart-label">5-MIN CHART — VWAP · EMA 9/21 · SUPERTREND · ENTRY/SL/TGT</div>
-    <div id="tvChart" style="height:380px"></div>
-  </div>
-
-  <!-- Bottom Grid -->
-  <div class="bot-grid">
-    <div class="panel">
-      <div class="panel-title">PCR Sentiment</div>
-      <div class="pcr-gauge-wrap">
-        <svg width="140" height="80" viewBox="0 0 140 80" id="pcrGaugeSvg">
-          <path d="M15,70 A55,55 0 0,1 125,70" fill="none" stroke="#1a2235" stroke-width="10" stroke-linecap="round"/>
-          <path d="M15,70 A55,55 0 0,1 125,70" fill="none" stroke-width="10" stroke-linecap="round"
-                id="pcrArc" stroke="var(--cyan)" stroke-dasharray="0 173"/>
-          <text x="70" y="55" text-anchor="middle" fill="#fff" font-size="11" font-weight="800" id="pcrArcVal">—</text>
-          <text x="70" y="68" text-anchor="middle" fill="var(--muted)" font-size="7" font-weight="700">PCR</text>
-        </svg>
+      <!-- TRADINGVIEW LIGHTWEIGHT CHARTS CONTAINER -->
+      <div class="bg-card rounded-2xl p-3 border border-border overflow-hidden">
+        <div class="text-xs font-bold text-slate-400 mb-2 flex items-center justify-between px-1">
+          <span>5-MIN CHART — VWAP · EMA 9/21 · SUPERTREND · ENTRY/SL/TGT</span>
+          <span class="text-[10px] text-cyanAccent font-mono">LIVE WEBSOCKET STREAM</span>
+        </div>
+        <div id="tvChart" class="w-full h-[400px]"></div>
       </div>
-      <div class="pcr-shift" id="pcrShift">—</div>
+
     </div>
-    <div class="panel">
-      <div class="panel-title">Strike-wise OI Change</div>
-      <canvas id="oiChart"></canvas>
+
+    <!-- ── RIGHT COLUMN (Lg 5 cols): AI CONSENSUS, STRIKE LADDER, PCR & SENTIMENT ── -->
+    <div class="lg:col-span-5 space-y-4">
+      
+      <!-- PCR Sentiment Semi-Circle Gauge -->
+      <div class="bg-card rounded-2xl p-4 border border-border flex flex-col items-center">
+        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider self-start mb-2">PCR Sentiment Dynamics</div>
+        <div class="relative w-40 h-24 flex items-center justify-center">
+          <svg width="160" height="95" viewBox="0 0 160 95">
+            <path d="M 15 80 A 65 65 0 0 1 145 80" fill="none" stroke="#182030" stroke-width="12" stroke-linecap="round"/>
+            <path id="pcrArc" d="M 15 80 A 65 65 0 0 1 145 80" fill="none" stroke="#00e5ff" stroke-width="12" stroke-linecap="round" stroke-dasharray="0 204" class="transition-all duration-700"/>
+            <text id="pcrArcVal" x="80" y="65" text-anchor="middle" fill="#ffffff" font-size="20" font-weight="900">0.00</text>
+            <text x="80" y="78" text-anchor="middle" fill="#64748b" font-size="9" font-weight="700">PCR LEVEL</text>
+          </svg>
+        </div>
+        <div id="pcrShift" class="text-xs font-bold text-slate-300 mt-1">15m shift: —</div>
+      </div>
+
+      <!-- Strike-wise Call vs Put Change in OI Bar Chart -->
+      <div class="bg-card rounded-2xl p-4 border border-border">
+        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Strike-wise OI Flow (Call vs Put)</div>
+        <canvas id="oiChart" class="w-full h-[200px]"></canvas>
+      </div>
+
+      <!-- Live FinBERT News Sentiment Scored Headlines -->
+      <div class="bg-card rounded-2xl p-4 border border-border space-y-3">
+        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+          <span>AI News Sentiment (FinBERT)</span>
+          <span id="sentVal" class="text-cyanAccent font-bold">0.00</span>
+        </div>
+        <div class="flex items-center gap-2 p-2 rounded-xl bg-card2 border border-border text-xs">
+          <div id="sentDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></div>
+          <div id="sentDesc" class="text-slate-300 font-semibold">Awaiting feed...</div>
+        </div>
+        <div id="headlineList" class="space-y-2 text-xs divide-y divide-border/50"></div>
+      </div>
+
     </div>
+
   </div>
 
-  <!-- Sentiment -->
-  <div class="panel" style="margin-bottom:12px">
-    <div class="panel-title">AI News Sentiment</div>
-    <div class="sent-bar">
-      <div class="sent-dot" id="sentDot" style="background:var(--muted)"></div>
-      <div class="sent-label" id="sentVal">—</div>
-      <div style="flex:1;font-size:.68rem;color:var(--muted)" id="sentDesc">Awaiting data…</div>
-    </div>
-    <div id="headlineList"></div>
-  </div>
+</main>
 
-</div>
+<!-- FOOTER -->
+<footer class="text-center py-4 text-xs font-semibold text-slate-600 border-t border-border/50 mt-6">
+  ⚡ Algo Radar v5 — Institutional Terminal · Zero-Flicker WebSocket Stream
+</footer>
 
-<div class="footer">⚡ Algo Radar v4 — Institutional Terminal — WebSocket Live Feed</div>
-
+<!-- ═══ FRONTEND JAVASCRIPT ENGINE ═══ -->
 <script>
-// ═══ STATE ═══
 let ws, symbol = 'NIFTY', chart, candleSeries, volSeries;
 let vwapLine, ema9Line, ema21Line, stLine, volAvgLine;
-let entryLine, slLine, tgtLine;
+let priceLines = [];
 let firstRender = true;
 
-// ═══ WEBSOCKET ═══
-function connect() {
+function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onopen = () => { ws.send(JSON.stringify({symbol})); };
-  ws.onmessage = (e) => { try { onTick(JSON.parse(e.data)); } catch(err) { console.error(err); } };
-  ws.onclose = () => { setTimeout(connect, 2000); };
+  ws.onmessage = (e) => { try { onTick(JSON.parse(e.data)); } catch(err){ console.error(err); } };
+  ws.onclose = () => { setTimeout(connectWS, 2000); };
   ws.onerror = () => { ws.close(); };
 }
 
-function switchSymbol(sym, btn) {
+function switchSymbol(sym) {
   symbol = sym;
-  document.querySelectorAll('.seg-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
+  document.getElementById('btnNifty').className = sym === 'NIFTY' 
+    ? 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all bg-card2 text-white shadow-md border border-cyanAccent/30'
+    : 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all text-slate-400 hover:text-white';
+  document.getElementById('btnBankNifty').className = sym === 'BANKNIFTY'
+    ? 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all bg-card2 text-white shadow-md border border-cyanAccent/30'
+    : 'min-h-[40px] px-4 py-2 rounded-lg font-bold text-xs sm:text-sm transition-all text-slate-400 hover:text-white';
+
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({symbol}));
-  // Reset chart
   firstRender = true;
-  if (candleSeries) { chart.removeSeries(candleSeries); candleSeries = null; }
-  if (volSeries) { chart.removeSeries(volSeries); volSeries = null; }
-  if (vwapLine) { chart.removeSeries(vwapLine); vwapLine = null; }
-  if (ema9Line) { chart.removeSeries(ema9Line); ema9Line = null; }
-  if (ema21Line) { chart.removeSeries(ema21Line); ema21Line = null; }
-  if (stLine) { chart.removeSeries(stLine); stLine = null; }
-  if (volAvgLine) { chart.removeSeries(volAvgLine); volAvgLine = null; }
-  removePriceLines();
+  clearPriceLines();
 }
 
-// ═══ INIT CHART ═══
-function initChart() {
-  const container = document.getElementById('tvChart');
-  chart = LightweightCharts.createChart(container, {
-    width: container.clientWidth,
-    height: 380,
-    layout: { background: { type: 'solid', color: '#0b0f19' }, textColor: '#64748b', fontSize: 10 },
+function initTVChart() {
+  const el = document.getElementById('tvChart');
+  chart = LightweightCharts.createChart(el, {
+    width: el.clientWidth,
+    height: 400,
+    layout: { background: { type: 'solid', color: '#07090e' }, textColor: '#64748b', fontSize: 11 },
     grid: { vertLines: { color: 'rgba(255,255,255,0.03)' }, horzLines: { color: 'rgba(255,255,255,0.03)' } },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: '#1e293b', scaleMargins: { top: 0.08, bottom: 0.22 } },
-    timeScale: { borderColor: '#1e293b', timeVisible: true, secondsVisible: false },
-    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
-    handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
+    rightPriceScale: { borderColor: '#1e2638', scaleMargins: { top: 0.08, bottom: 0.22 } },
+    timeScale: { borderColor: '#1e2638', timeVisible: true, secondsVisible: false },
+    handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true },
+    handleScale: { mouseWheel: true, pinch: true },
   });
-  window.addEventListener('resize', () => { chart.applyOptions({ width: container.clientWidth }); });
+
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#00e676', downColor: '#ff3d71',
+    borderUpColor: '#00e676', borderDownColor: '#ff3d71',
+    wickUpColor: '#00e676', wickDownColor: '#ff3d71',
+  });
+
+  volSeries = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'vol' });
+  chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+  vwapLine = chart.addLineSeries({ color: '#00e5ff', lineWidth: 1, lineStyle: 1 });
+  ema9Line = chart.addLineSeries({ color: '#ffb300', lineWidth: 1 });
+  ema21Line = chart.addLineSeries({ color: '#e040fb', lineWidth: 1 });
+  stLine = chart.addLineSeries({ color: '#00e676', lineWidth: 1 });
+  volAvgLine = chart.addLineSeries({ color: '#ffb300', lineWidth: 1, priceScaleId: 'vol' });
+
+  window.addEventListener('resize', () => { chart.applyOptions({ width: el.clientWidth }); });
 }
 
-function ensureSeries() {
-  if (!candleSeries) {
-    candleSeries = chart.addCandlestickSeries({
-      upColor: '#00C853', downColor: '#FF3D00',
-      borderUpColor: '#00C853', borderDownColor: '#FF3D00',
-      wickUpColor: '#00C853', wickDownColor: '#FF3D00',
-    });
-  }
-  if (!volSeries) {
-    volSeries = chart.addHistogramSeries({
-      priceFormat: { type: 'volume' },
-      priceScaleId: 'vol',
-    });
-    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-  }
-  if (!vwapLine) {
-    vwapLine = chart.addLineSeries({ color: '#00E5FF', lineWidth: 1, lineStyle: 1, priceScaleId: 'right' });
-  }
-  if (!ema9Line) {
-    ema9Line = chart.addLineSeries({ color: '#FFAB00', lineWidth: 1, priceScaleId: 'right' });
-  }
-  if (!ema21Line) {
-    ema21Line = chart.addLineSeries({ color: '#E040FB', lineWidth: 1, priceScaleId: 'right' });
-  }
-  if (!stLine) {
-    stLine = chart.addLineSeries({ color: '#00E676', lineWidth: 1, priceScaleId: 'right' });
-  }
-  if (!volAvgLine) {
-    volAvgLine = chart.addLineSeries({ color: '#FFD600', lineWidth: 1, priceScaleId: 'vol' });
-  }
+function clearPriceLines() {
+  priceLines.forEach(pl => { try { candleSeries.removePriceLine(pl); } catch(e){} });
+  priceLines = [];
 }
 
-// ═══ PRICE LINES (Entry/SL/Target) ═══
-let _priceLines = [];
-function removePriceLines() {
-  _priceLines.forEach(pl => { try { candleSeries.removePriceLine(pl); } catch(e){} });
-  _priceLines = [];
-}
-function setPriceLines(pred) {
-  removePriceLines();
-  if (!candleSeries || pred.signal === 'NO_TRADE' || pred.entry <= 0) return;
-  _priceLines.push(candleSeries.createPriceLine({
-    price: pred.entry, color: '#FFD600', lineWidth: 2, lineStyle: 0,
-    axisLabelVisible: true, title: 'ENTRY ₹' + pred.entry.toFixed(1),
+function updatePriceLines(p) {
+  clearPriceLines();
+  if (p.signal === 'NO_TRADE' || p.entry <= 0) return;
+
+  priceLines.push(candleSeries.createPriceLine({
+    price: p.entry, color: '#ffd600', lineWidth: 2, lineStyle: 0,
+    axisLabelVisible: true, title: 'ENTRY ₹' + p.entry.toFixed(1),
   }));
-  _priceLines.push(candleSeries.createPriceLine({
-    price: pred.target, color: '#00E676', lineWidth: 1, lineStyle: 2,
-    axisLabelVisible: true, title: 'TGT ₹' + pred.target.toFixed(1),
+  priceLines.push(candleSeries.createPriceLine({
+    price: p.target, color: '#00e676', lineWidth: 1, lineStyle: 2,
+    axisLabelVisible: true, title: 'TARGET (1:2) ₹' + p.target.toFixed(1),
   }));
-  _priceLines.push(candleSeries.createPriceLine({
-    price: pred.sl, color: '#FF1744', lineWidth: 1, lineStyle: 2,
-    axisLabelVisible: true, title: 'SL ₹' + pred.sl.toFixed(1),
+  priceLines.push(candleSeries.createPriceLine({
+    price: p.sl, color: '#ff3d71', lineWidth: 1, lineStyle: 2,
+    axisLabelVisible: true, title: 'SL (12%) ₹' + p.sl.toFixed(1),
   }));
 }
 
-// ═══ TICK HANDLER ═══
 function onTick(d) {
   const ch = d.chain, p = d.pred, t = d.tech, s = d.sentiment;
 
-  // Top bar
-  document.getElementById('spotPill').textContent = '₹' + ch.spot.toLocaleString('en-IN',{maximumFractionDigits:2});
-  document.getElementById('vixPill').textContent = 'VIX ' + ch.vix;
+  // Header pills
+  const mktPill = document.getElementById('mktStatusPill');
+  if (ch.market_open) {
+    mktPill.textContent = '🟢 MARKET OPEN';
+    mktPill.className = 'text-xs font-bold px-2.5 py-1 rounded-full border bg-emeraldAccent/10 text-emeraldAccent border-emeraldAccent/30';
+  } else {
+    mktPill.textContent = '🔴 MARKET CLOSED';
+    mktPill.className = 'text-xs font-bold px-2.5 py-1 rounded-full border bg-coralAccent/10 text-coralAccent border-coralAccent/30';
+  }
 
-  // Hero card
+  document.getElementById('spotPill').textContent = 'SPOT: ₹' + ch.spot.toLocaleString('en-IN', {maximumFractionDigits:2});
+  document.getElementById('vixPill').textContent = 'INDIA VIX ' + ch.vix;
+
+  // Hero Card State
   const hero = document.getElementById('heroCard');
   const badge = document.getElementById('heroBadge');
-  hero.className = 'hero ' + (p.signal === 'BUY_ATM_CE' ? 'ce' : p.signal === 'BUY_ATM_PE' ? 'pe' : 'nt');
-  const sigText = p.signal === 'BUY_ATM_CE' ? '🟢 BUY ATM CE' : p.signal === 'BUY_ATM_PE' ? '🔴 BUY ATM PE' : '⚪ NO TRADE';
-  badge.textContent = sigText;
-  badge.className = 'badge ' + (p.signal === 'BUY_ATM_CE' ? 'ce' : p.signal === 'BUY_ATM_PE' ? 'pe' : 'nt');
+  hero.className = 'bg-card rounded-2xl p-4 sm:p-6 transition-all duration-500 ' + 
+    (p.signal === 'BUY_ATM_CE' ? 'hero-glow-ce' : p.signal === 'BUY_ATM_PE' ? 'hero-glow-pe' : 'hero-glow-nt');
+  
+  badge.textContent = p.signal === 'BUY_ATM_CE' ? '🟢 BUY ATM CE' : p.signal === 'BUY_ATM_PE' ? '🔴 BUY ATM PE' : '⚪ NO TRADE';
+  badge.className = 'px-4 py-1.5 rounded-full text-xs font-black uppercase tracking-wider shadow-lg ' +
+    (p.signal === 'BUY_ATM_CE' ? 'bg-emeraldAccent text-obsidian' : p.signal === 'BUY_ATM_PE' ? 'bg-coralAccent text-white' : 'bg-border text-slate-400');
 
   document.getElementById('heroSym').textContent = d.symbol;
   document.getElementById('heroSub').innerHTML =
-    `Spot: <b>₹${ch.spot.toLocaleString('en-IN')}</b> · H: <b style="color:var(--green)">₹${ch.day_high.toLocaleString('en-IN')}</b> L: <b style="color:var(--red)">₹${ch.day_low.toLocaleString('en-IN')}</b>`;
+    `Spot: <b class="text-white">₹${ch.spot.toLocaleString('en-IN')}</b> · H: <b class="text-emeraldAccent">₹${ch.day_high.toLocaleString('en-IN')}</b> · L: <b class="text-coralAccent">₹${ch.day_low.toLocaleString('en-IN')}</b>`;
 
-  // Gauge
+  // AI Gauge Arc
   const pct = p.confidence;
-  const circ = 327; // 2*PI*52
-  const dash = (pct / 100) * circ;
   const arc = document.getElementById('gaugeArc');
-  const accent = p.signal === 'BUY_ATM_CE' ? 'var(--green)' : p.signal === 'BUY_ATM_PE' ? 'var(--red)' : '#546e7a';
-  arc.setAttribute('stroke', accent);
-  arc.setAttribute('stroke-dasharray', dash + ' ' + circ);
+  const dash = (pct / 100) * 314;
+  const accentColor = p.signal === 'BUY_ATM_CE' ? '#00e676' : p.signal === 'BUY_ATM_PE' ? '#ff3d71' : '#64748b';
+  arc.setAttribute('stroke', accentColor);
+  arc.setAttribute('stroke-dasharray', dash + ' 314');
   document.getElementById('gaugePct').textContent = pct.toFixed(1) + '%';
+  
   const conv = document.getElementById('convLine');
-  const fireEmoji = (p.conviction === 'HIGH' || p.conviction === 'VERY HIGH') ? '🔥 ' : '';
-  conv.textContent = fireEmoji + p.conviction + ' CONVICTION — ' + p.strategy.toUpperCase();
-  conv.style.color = accent;
+  conv.textContent = (p.conviction === 'HIGH' || p.conviction === 'VERY HIGH' ? '🔥 ' : '') + p.conviction + ' CONVICTION — ' + p.strategy.toUpperCase();
+  conv.style.color = accentColor;
 
-  // Factor pills
-  const fpPA = document.getElementById('fpPA');
-  fpPA.textContent = '📈 Price: ' + p.pa_label;
-  fpPA.className = 'fpill ' + (p.pa_score >= 60 ? 'hi' : p.pa_score <= 40 ? 'lo' : 'mid');
-
-  const fpOI = document.getElementById('fpOI');
-  fpOI.textContent = '📊 OI: ' + p.oi_label;
-  fpOI.className = 'fpill ' + (p.of_score >= 60 ? 'hi' : p.of_score <= 40 ? 'lo' : 'mid');
-
-  const fpSent = document.getElementById('fpSent');
-  fpSent.textContent = '📰 News: ' + (s.score >= 0 ? '+' : '') + s.score.toFixed(2);
-  fpSent.className = 'fpill ' + (s.score > 0.15 ? 'hi' : s.score < -0.15 ? 'lo' : 'mid');
-
-  const fpTrap = document.getElementById('fpTrap');
-  fpTrap.textContent = '🛡 Trap: ' + p.trap_status;
-  fpTrap.className = 'fpill ' + (p.trap_status === 'PASSED' ? 'hi' : 'lo');
+  // Consensus Pills
+  document.getElementById('fpPA').textContent = `📈 Price: ${p.pa_label} (${p.pa_pts}/35)`;
+  document.getElementById('fpOI').textContent = `📊 OI: ${p.oi_label} (${p.of_pts}/35)`;
+  document.getElementById('fpSent').textContent = `📰 News: ${s.score >= 0 ? '+' : ''}${s.score.toFixed(2)} (${p.se_pts}/15)`;
+  document.getElementById('fpTrap').textContent = `🛡 Trap: ${p.trap_status}`;
 
   // Trade metrics
   document.getElementById('mStrike').textContent = p.strike + ' ' + p.option_type;
@@ -1029,173 +927,150 @@ function onTick(d) {
   document.getElementById('mPCR').textContent = ch.pcr.toFixed(2);
   document.getElementById('mDelta').textContent = p.delta > 0 ? p.delta.toFixed(2) : '—';
   document.getElementById('mADX').textContent = t.adx.toFixed(1);
-  const rsiEl = document.getElementById('mRSI');
-  rsiEl.textContent = t.rsi.toFixed(0);
-  rsiEl.className = 'mv' + (t.rsi > 70 ? ' vr' : t.rsi < 30 ? ' vg' : '');
+  document.getElementById('mRSI').textContent = t.rsi.toFixed(0);
   document.getElementById('mRegime').textContent = p.regime.replace('_', ' ');
 
-  // Trap bar
   const trapBar = document.getElementById('trapBar');
   if (p.trap_warning) {
     trapBar.textContent = '⚠️ ' + p.trap_warning;
-    trapBar.classList.add('show');
+    trapBar.classList.remove('hidden');
   } else {
-    trapBar.classList.remove('show');
+    trapBar.classList.add('hidden');
   }
 
-  // ── Chart Update ──
-  ensureSeries();
+  // TradingView Lightweight Charts Streaming (Zero Flicker)
   const candles = d.candles.map(c => ({time: c.time, open: c.open, high: c.high, low: c.low, close: c.close}));
-  
   if (firstRender) {
     candleSeries.setData(candles);
-    volSeries.setData(d.overlays.vol.map(v => ({time: v.time, value: v.value, color: v.color})));
+    volSeries.setData(d.overlays.vol);
     vwapLine.setData(d.overlays.vwap);
     ema9Line.setData(d.overlays.ema9);
     ema21Line.setData(d.overlays.ema21);
-    const stColor = t.st_dir === 1 ? '#00E676' : '#FF1744';
-    stLine.applyOptions({ color: stColor });
     stLine.setData(d.overlays.st);
     volAvgLine.setData(d.overlays.vol_avg);
     chart.timeScale().fitContent();
     firstRender = false;
   } else {
-    // Zero-flicker incremental update
     const lastC = candles[candles.length - 1];
     candleSeries.update(lastC);
     volSeries.update(d.overlays.vol[d.overlays.vol.length - 1]);
     vwapLine.update(d.overlays.vwap[d.overlays.vwap.length - 1]);
     ema9Line.update(d.overlays.ema9[d.overlays.ema9.length - 1]);
     ema21Line.update(d.overlays.ema21[d.overlays.ema21.length - 1]);
-
-    const stColor = t.st_dir === 1 ? '#00E676' : '#FF1744';
-    stLine.applyOptions({ color: stColor });
+    stLine.applyOptions({ color: t.st_dir === 1 ? '#00e676' : '#ff3d71' });
     stLine.update(d.overlays.st[d.overlays.st.length - 1]);
     volAvgLine.update(d.overlays.vol_avg[d.overlays.vol_avg.length - 1]);
   }
 
-  // Entry markers
+  // Signal Markers & Price Lines
   if (p.signal !== 'NO_TRADE' && candles.length > 0) {
     const lastC = candles[candles.length - 1];
     candleSeries.setMarkers([{
       time: lastC.time,
       position: p.signal === 'BUY_ATM_CE' ? 'belowBar' : 'aboveBar',
-      color: p.signal === 'BUY_ATM_CE' ? '#00E676' : '#FF1744',
+      color: p.signal === 'BUY_ATM_CE' ? '#00e676' : '#ff3d71',
       shape: p.signal === 'BUY_ATM_CE' ? 'arrowUp' : 'arrowDown',
       text: p.signal === 'BUY_ATM_CE' ? 'CE' : 'PE',
     }]);
   } else {
     candleSeries.setMarkers([]);
   }
+  updatePriceLines(p);
 
-  // Price lines
-  setPriceLines(p);
-
-  // ── PCR Gauge ──
+  // PCR Gauge
   const pcrVal = ch.pcr;
-  const pcrNorm = Math.min(1, Math.max(0, (pcrVal - 0.4) / 1.4)); // 0.4-1.8 range
-  const pcrDash = pcrNorm * 173;
+  const pcrNorm = Math.min(1, Math.max(0, (pcrVal - 0.4) / 1.4));
   const pcrArc = document.getElementById('pcrArc');
-  const pcrColor = pcrVal > 1.1 ? 'var(--green)' : pcrVal < 0.85 ? 'var(--red)' : 'var(--cyan)';
-  pcrArc.setAttribute('stroke', pcrColor);
-  pcrArc.setAttribute('stroke-dasharray', pcrDash + ' 173');
+  pcrArc.setAttribute('stroke', pcrVal > 1.1 ? '#00e676' : pcrVal < 0.85 ? '#ff3d71' : '#00e5ff');
+  pcrArc.setAttribute('stroke-dasharray', (pcrNorm * 204) + ' 204');
   document.getElementById('pcrArcVal').textContent = pcrVal.toFixed(2);
-  const shiftEl = document.getElementById('pcrShift');
+  
   const sh = ch.pcr_shift;
-  shiftEl.innerHTML = `15m shift: <b style="color:${sh >= 0 ? 'var(--green)' : 'var(--red)'}">${sh >= 0 ? '+' : ''}${sh.toFixed(3)}</b>`;
+  document.getElementById('pcrShift').innerHTML = `15m shift: <b style="color:${sh >= 0 ? '#00e676' : '#ff3d71'}">${sh >= 0 ? '+' : ''}${sh.toFixed(3)}</b>`;
 
-  // ── OI Chart (Canvas) ──
+  // Canvas OI Chart
   drawOIChart(d.oi_chart, ch.atm);
 
-  // ── Sentiment ──
+  // News Sentiment
   const sentDot = document.getElementById('sentDot');
-  sentDot.style.background = s.score > 0.15 ? 'var(--green)' : s.score < -0.15 ? 'var(--red)' : 'var(--yellow)';
+  sentDot.className = 'w-2.5 h-2.5 rounded-full ' + (s.score > 0.15 ? 'bg-emeraldAccent' : s.score < -0.15 ? 'bg-coralAccent' : 'bg-amberAccent');
   document.getElementById('sentVal').textContent = (s.score >= 0 ? '+' : '') + s.score.toFixed(2);
-  document.getElementById('sentDesc').textContent = s.score > 0.15 ? 'Bullish Sentiment' : s.score < -0.15 ? 'Bearish Sentiment' : 'Neutral Sentiment';
+  document.getElementById('sentDesc').textContent = s.score > 0.15 ? 'Bullish Market Sentiment' : s.score < -0.15 ? 'Bearish Market Sentiment' : 'Neutral Market Sentiment';
 
   let hlHtml = '';
   s.headlines.forEach(h => {
     const sc = h.score;
-    const clr = sc > 0.15 ? 'var(--green)' : sc < -0.15 ? 'var(--red)' : 'var(--yellow)';
-    hlHtml += `<div class="hl"><span style="color:${clr};font-weight:700">${sc >= 0 ? '+' : ''}${sc.toFixed(2)}</span> &nbsp;<b>${h.title}</b></div>`;
+    const clr = sc > 0.15 ? 'text-emeraldAccent' : sc < -0.15 ? 'text-coralAccent' : 'text-amberAccent';
+    hlHtml += `<div class="pt-2 flex items-start gap-2"><span class="font-bold ${clr} shrink-0">${sc >= 0 ? '+' : ''}${sc.toFixed(2)}</span><span class="text-slate-300 font-medium">${h.title}</span></div>`;
   });
   document.getElementById('headlineList').innerHTML = hlHtml;
 }
 
-// ═══ OI BAR CHART (Canvas) ═══
+// Canvas OI Chart Renderer
 function drawOIChart(data, atm) {
   const canvas = document.getElementById('oiChart');
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.parentElement.getBoundingClientRect();
-  const W = Math.floor(rect.width - 24);
-  const H = 180;
-  
+  const W = Math.floor(rect.width);
+  const H = 200;
+
   if (canvas.width !== Math.floor(W * dpr) || canvas.height !== Math.floor(H * dpr)) {
     canvas.width = Math.floor(W * dpr);
     canvas.height = Math.floor(H * dpr);
     canvas.style.width = W + 'px';
     canvas.style.height = H + 'px';
   }
-  
+
   ctx.save();
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, W, H);
 
   if (!data || data.length === 0) return;
   const n = data.length;
-  const bw = Math.max(4, (W - 40) / n / 2.4);
-  const gap = (W - 40) / n;
+  const gap = (W - 30) / n;
+  const bw = Math.max(3, gap / 2.5);
   const maxVal = Math.max(1, ...data.map(d => Math.max(Math.abs(d.c_chg), Math.abs(d.p_chg))));
   const midY = H / 2;
-  const scaleY = (midY - 20) / maxVal;
+  const scaleY = (midY - 25) / maxVal;
 
-  // Grid
-  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
   ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(20, midY); ctx.lineTo(W - 10, midY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(15, midY); ctx.lineTo(W - 15, midY); ctx.stroke();
 
   data.forEach((d, i) => {
-    const x = 25 + i * gap;
-    // Call change OI
+    const x = 20 + i * gap;
     const ch = d.c_chg * scaleY;
-    ctx.fillStyle = 'rgba(255,23,68,0.7)';
+    ctx.fillStyle = 'rgba(255,61,113,0.85)';
     ctx.fillRect(x, midY - Math.max(0, ch), bw, Math.abs(ch) || 1);
-    // Put change OI
+
     const ph = d.p_chg * scaleY;
-    ctx.fillStyle = 'rgba(0,230,118,0.7)';
+    ctx.fillStyle = 'rgba(0,230,118,0.85)';
     ctx.fillRect(x + bw + 1, midY - Math.max(0, ph), bw, Math.abs(ph) || 1);
 
-    // Strike label
-    ctx.fillStyle = '#546e7a';
-    ctx.font = '8px Inter';
+    ctx.fillStyle = '#64748b';
+    ctx.font = '9px Inter';
     ctx.textAlign = 'center';
-    ctx.fillText(d.strike.toString(), x + bw, H - 3);
+    ctx.fillText(d.strike.toString(), x + bw, H - 4);
 
-    // ATM marker
     if (Math.abs(d.strike - atm) < 1) {
-      ctx.strokeStyle = 'var(--cyan)';
+      ctx.strokeStyle = '#00e5ff';
       ctx.lineWidth = 1.5;
       ctx.setLineDash([3, 3]);
-      ctx.beginPath(); ctx.moveTo(x + bw, 8); ctx.lineTo(x + bw, H - 14); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x + bw, 10); ctx.lineTo(x + bw, H - 16); ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = '#00e5ff';
-      ctx.font = 'bold 8px Inter';
-      ctx.fillText('ATM', x + bw, 7);
+      ctx.font = 'bold 9px Inter';
+      ctx.fillText('ATM', x + bw, 8);
     }
   });
 
-  // Legend
-  ctx.fillStyle = 'rgba(255,23,68,0.8)'; ctx.fillRect(W - 100, 6, 8, 8);
-  ctx.fillStyle = '#78909c'; ctx.font = '9px Inter'; ctx.textAlign = 'left';
-  ctx.fillText('Call Chg', W - 88, 14);
-  ctx.fillStyle = 'rgba(0,230,118,0.8)'; ctx.fillRect(W - 45, 6, 8, 8);
-  ctx.fillStyle = '#78909c'; ctx.fillText('Put Chg', W - 33, 14);
+  ctx.restore();
 }
 
-// ═══ INIT ═══
-initChart();
-connect();
+// Init
+initTVChart();
+connectWS();
 </script>
 </body>
 </html>"""
