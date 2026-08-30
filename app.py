@@ -246,7 +246,7 @@ def _score_headline_lexicon(text: str) -> float:
     elif neg > pos: return max(-1.0, -0.3 - 0.15 * (neg - pos))
     return 0.0
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_resource(ttl=15, show_spinner=False)
 def fetch_and_score_sentiment() -> Tuple[float, int, List[Dict[str, Any]]]:
     nlp = _load_finbert()
     headlines_data: List[Dict[str, Any]] = []
@@ -351,7 +351,7 @@ class TechnicalState:
     price_action_score: float
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_resource(ttl=15, show_spinner=False)
 def compute_technicals(df: pd.DataFrame) -> Tuple[pd.DataFrame, TechnicalState]:
     d = df.copy()
     tp = (d["high"] + d["low"] + d["close"]) / 3
