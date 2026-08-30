@@ -40,12 +40,6 @@ try:
 except ImportError:
     _HAS_FEEDPARSER = False
 
-try:
-    from transformers import pipeline as hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer
-    _HAS_TRANSFORMERS = True
-except ImportError:
-    _HAS_TRANSFORMERS = False
-
 import requests
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -231,13 +225,14 @@ def generate_option_chain_snapshot(symbol: str, access_token: Optional[str] = No
 
 @st.cache_resource(show_spinner=False)
 def _load_finbert():
-    if not _HAS_TRANSFORMERS: return None
     try:
+        from transformers import pipeline as hf_pipeline, AutoModelForSequenceClassification, AutoTokenizer
         name = "ProsusAI/finbert"
         tok = AutoTokenizer.from_pretrained(name)
         mdl = AutoModelForSequenceClassification.from_pretrained(name)
         return hf_pipeline("sentiment-analysis", model=mdl, tokenizer=tok, device=-1, top_k=None, truncation=True, max_length=512)
-    except Exception: return None
+    except Exception:
+        return None
 
 def _score_headline_lexicon(text: str) -> float:
     lower = text.lower()
