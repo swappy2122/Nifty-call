@@ -1,35 +1,31 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
- ALGO RADAR v5 — UNIFIED INSTITUTIONAL ALGO TRADING TERMINAL
- NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Engine
+ ALGO RADAR v5 — Institutional-Grade Pure Streamlit Terminal
+ NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Dashboard
 ═══════════════════════════════════════════════════════════════════════════════
- Unified Single-File Engine combining:
-  1. Streamlit Dashboard App (streamlit run app.py) for Streamlit Cloud
-  2. FastAPI + Async WebSocket server (uvicorn app:app --port 8000)
-  3. Upstox API v2 / Synthetic Option Chain Dynamics & Microstructure
-  4. FinBERT AI News Sentiment (Moneycontrol & ET RSS)
-  5. 5-Min Multi-Indicator Technical Engine (VWAP, Supertrend, 9/21 EMA, ADX)
-  6. Multi-Agent AI Consensus Radar (35% PA + 35% OI + 15% Sent + 15% Greeks)
-  7. Plotly & TradingView Lightweight Charts v4.x Zero-Flicker Streaming
-  8. Active Trade SL/Target Locking in st.session_state
-  9. NSE Market Hours Check with Static Data Freeze when Closed
+ 100% Pure Streamlit application optimized for Streamlit Cloud deployment.
+ Features:
+  - Upstox API v2 / High-fidelity option chain simulation
+  - FinBERT AI News Sentiment (Moneycontrol & ET RSS)
+  - 5-Min Multi-Indicator Technical Engine (VWAP, Supertrend, 9/21 EMA, ADX)
+  - Multi-Agent AI Consensus Radar (35% PA + 35% OI + 15% Sent + 15% Greeks)
+  - Plotly Candlestick Chart with Entry/SL/Target overlays & uirevision zoom lock
+  - Active Trade Locking in st.session_state (locks SL/Target across refreshes)
+  - NSE Market Hours check with static data freeze when closed
 
- Streamlit Run: streamlit run app.py
- FastAPI Run:   uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+ Run: streamlit run app.py
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import math
 import re
 import textwrap
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,10 +33,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-
-# Optional heavy imports with graceful fallbacks
+# Optional heavy imports with fallbacks
 try:
     import feedparser
     _HAS_FEEDPARSER = True
@@ -56,10 +49,19 @@ except ImportError:
 import requests
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  FASTAPI APPLICATION & CONSTANTS                                        ║
+# ║  STREAMLIT PAGE CONFIGURATION                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-app = FastAPI(title="Algo Radar v5 Unified", version="5.0.0")
+st.set_page_config(
+    page_title="Algo Radar v5 | NIFTY & BANKNIFTY",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  CONSTANTS & REGISTRY                                                   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
 
 INSTRUMENT_CONFIG = {
     "NIFTY": {"step": 50.0, "base_spot": 24535.0, "lot_size": 25, "base_vix": 13.5},
@@ -291,8 +293,6 @@ def fetch_and_score_sentiment() -> Tuple[float, int, List[Dict[str, Any]]]:
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  MODULE 3: TECHNICAL & MOMENTUM ENGINE (5-Min OHLCV)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-
-_candle_store: Dict[str, List[dict]] = {}
 
 def generate_5min_ohlcv(symbol: str, base_price: float, bars: int = 78) -> pd.DataFrame:
     market_open = is_nse_market_open()
