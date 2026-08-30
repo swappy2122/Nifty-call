@@ -1,31 +1,35 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
- ALGO RADAR v5 — Institutional-Grade Streamlit Terminal
- NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Dashboard
+ ALGO RADAR v5 — UNIFIED INSTITUTIONAL ALGO TRADING TERMINAL
+ NIFTY 50 & BANKNIFTY Real-Time Option Trading Predictor & Execution Engine
 ═══════════════════════════════════════════════════════════════════════════════
- Self-contained Streamlit application for Streamlit Cloud & local deployment.
- Combines:
-  - Upstox API v2 Option Chain Dynamics / High-fidelity market simulation
-  - FinBERT AI News Sentiment (Moneycontrol & ET RSS)
-  - 5-Min Multi-Indicator Technical Engine (VWAP, Supertrend, 9/21 EMA, ADX)
-  - Multi-Agent AI Consensus Radar (35% PA + 35% OI + 15% Sent + 15% Greeks)
-  - Plotly Candlestick Chart with Entry/SL/Target overlays & uirevision zoom lock
-  - Active Trade Locking in st.session_state (locks SL/Target across refreshes)
-  - NSE Market Hours check with static data freeze when closed
+ Unified Single-File Engine combining:
+  1. Streamlit Dashboard App (streamlit run app.py) for Streamlit Cloud
+  2. FastAPI + Async WebSocket server (uvicorn app:app --port 8000)
+  3. Upstox API v2 / Synthetic Option Chain Dynamics & Microstructure
+  4. FinBERT AI News Sentiment (Moneycontrol & ET RSS)
+  5. 5-Min Multi-Indicator Technical Engine (VWAP, Supertrend, 9/21 EMA, ADX)
+  6. Multi-Agent AI Consensus Radar (35% PA + 35% OI + 15% Sent + 15% Greeks)
+  7. Plotly & TradingView Lightweight Charts v4.x Zero-Flicker Streaming
+  8. Active Trade SL/Target Locking in st.session_state
+  9. NSE Market Hours Check with Static Data Freeze when Closed
 
- Run: streamlit run app.py
+ Streamlit Run: streamlit run app.py
+ FastAPI Run:   uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
 import re
 import textwrap
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,7 +37,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-# Optional heavy imports
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+
+# Optional heavy imports with graceful fallbacks
 try:
     import feedparser
     _HAS_FEEDPARSER = True
@@ -49,19 +56,10 @@ except ImportError:
 import requests
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  STREAMLIT PAGE CONFIGURATION                                          ║
+# ║  FASTAPI APPLICATION & CONSTANTS                                        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(
-    page_title="Algo Radar v5 | NIFTY & BANKNIFTY",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  CONSTANTS & REGISTRY                                                   ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+app = FastAPI(title="Algo Radar v5 Unified", version="5.0.0")
 
 INSTRUMENT_CONFIG = {
     "NIFTY": {"step": 50.0, "base_spot": 24535.0, "lot_size": 25, "base_vix": 13.5},
@@ -131,19 +129,31 @@ class OptionChainSnapshot:
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+_tick_state: Dict[str, float] = {}
+
+def _walk_spot(symbol: str) -> float:
+    cfg = INSTRUMENT_CONFIG[symbol]
+    if symbol not in _tick_state:
+        _tick_state[symbol] = cfg["base_spot"]
+    if not is_nse_market_open():
+        return _tick_state[symbol]
+    drift = float(np.random.normal(0, 0.0002)) * _tick_state[symbol]
+    _tick_state[symbol] = round(_tick_state[symbol] + drift, 2)
+    return _tick_state[symbol]
+
+
 def generate_option_chain_snapshot(symbol: str, access_token: Optional[str] = None) -> OptionChainSnapshot:
     cfg = INSTRUMENT_CONFIG[symbol]
     step = cfg["step"]
+    spot = _walk_spot(symbol)
 
     market_open = is_nse_market_open()
     seed = 1000 + hash(symbol) % 10000 if not market_open else int(time.time() // 15) + hash(symbol) % 10000
     np.random.seed(seed)
 
-    jitter = float(np.random.normal(0, 6.0 if symbol == "NIFTY" else 22.0))
-    spot = round(cfg["base_spot"] + jitter, 2)
-    day_high = round(spot + abs(np.random.normal(40, 12)), 2)
-    day_low = round(spot - abs(np.random.normal(35, 10)), 2)
-    vix = round(cfg["base_vix"] + np.random.normal(0, 0.8), 2)
+    vix = round(cfg["base_vix"] + float(np.random.normal(0, 0.3)), 2)
+    day_high = round(spot + abs(float(np.random.normal(35, 12))), 2)
+    day_low = round(spot - abs(float(np.random.normal(30, 10))), 2)
 
     atm_strike = round(spot / step) * step
     strikes = [atm_strike + i * step for i in range(-5, 6)]
@@ -185,7 +195,7 @@ def generate_option_chain_snapshot(symbol: str, access_token: Optional[str] = No
     pcr_prev = round(pcr + np.random.uniform(-0.12, 0.12), 3)
     pcr_shift = round(pcr - pcr_prev, 3)
 
-    # Max Pain
+    # Max Pain calculation
     ss = df["strike_price"].values
     co = df["call_oi"].values; po = df["put_oi"].values
     S = ss[:, np.newaxis]; K = ss[np.newaxis, :]
@@ -281,6 +291,8 @@ def fetch_and_score_sentiment() -> Tuple[float, int, List[Dict[str, Any]]]:
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  MODULE 3: TECHNICAL & MOMENTUM ENGINE (5-Min OHLCV)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+
+_candle_store: Dict[str, List[dict]] = {}
 
 def generate_5min_ohlcv(symbol: str, base_price: float, bars: int = 78) -> pd.DataFrame:
     market_open = is_nse_market_open()
@@ -567,7 +579,6 @@ def run_prediction_engine(chain: OptionChainSnapshot, tech: TechnicalState, sent
 
 def build_candlestick_chart(df: pd.DataFrame, signal: str, tech: TechnicalState, entry_price: float = 0.0, target_price: float = 0.0, stop_loss: float = 0.0) -> go.Figure:
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.72, 0.28])
-    x_full = df["timestamp"].tolist()
 
     fig.add_trace(go.Candlestick(
         x=df["timestamp"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
@@ -648,7 +659,7 @@ def build_oi_chart(df: pd.DataFrame, atm_strike: float) -> go.Figure:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  MODULE 6: STREAMLIT UI & THEME                                         ║
+# ║  MODULE 6: STREAMLIT DASHBOARD UI ENGINE                                ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 DARK_CSS = """
