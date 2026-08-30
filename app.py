@@ -788,12 +788,16 @@ def run_prediction_engine(
 
 def build_candlestick_chart(
     df: pd.DataFrame, signal: str, tech: TechnicalState,
+    entry_price: float = 0.0, target_price: float = 0.0, stop_loss: float = 0.0,
 ) -> go.Figure:
-    """Build dual-subplot candlestick chart with VWAP, EMAs, entry markers, and volume."""
+    """Build dual-subplot candlestick chart with VWAP, EMAs, entry markers,
+    Entry/Target/SL overlay lines, shaded risk-reward zones, and volume."""
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
         row_heights=[0.72, 0.28],
     )
+
+    x_full = df["timestamp"].tolist()
 
     # Candlestick
     fig.add_trace(go.Candlestick(
@@ -843,6 +847,55 @@ def build_candlestick_chart(
             name="ENTRY", showlegend=True,
         ), row=1, col=1)
 
+    # ── Entry / Target / Stop-Loss Overlay Lines + Shaded Zones ──
+    if signal in ("BUY_ATM_CE", "BUY_ATM_PE") and entry_price > 0:
+        # Shaded zone: Entry → Target (green risk-reward band)
+        fig.add_trace(go.Scatter(
+            x=x_full, y=[target_price] * len(x_full),
+            mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=x_full, y=[entry_price] * len(x_full),
+            mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+            fill="tonexty", fillcolor="rgba(0,230,118,0.07)",
+        ), row=1, col=1)
+
+        # Shaded zone: Entry → Stop-Loss (red risk band)
+        fig.add_trace(go.Scatter(
+            x=x_full, y=[entry_price] * len(x_full),
+            mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=x_full, y=[stop_loss] * len(x_full),
+            mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip",
+            fill="tonexty", fillcolor="rgba(255,23,68,0.07)",
+        ), row=1, col=1)
+
+        # Solid yellow Entry line
+        fig.add_hline(
+            y=entry_price, row=1, col=1,
+            line_width=2, line_color="#FFD600",
+            annotation_text=f"ENTRY @ ₹{entry_price:.1f}",
+            annotation_position="top left",
+            annotation_font=dict(size=10, color="#FFD600", family="Inter"),
+        )
+        # Dashed neon green Target line
+        fig.add_hline(
+            y=target_price, row=1, col=1,
+            line_width=1.5, line_dash="dash", line_color="#00E676",
+            annotation_text=f"TARGET (1:2) @ ₹{target_price:.1f}",
+            annotation_position="top left",
+            annotation_font=dict(size=10, color="#00E676", family="Inter"),
+        )
+        # Dashed neon red Stop-Loss line
+        fig.add_hline(
+            y=stop_loss, row=1, col=1,
+            line_width=1.5, line_dash="dash", line_color="#FF1744",
+            annotation_text=f"STOP-LOSS (12%) @ ₹{stop_loss:.1f}",
+            annotation_position="bottom left",
+            annotation_font=dict(size=10, color="#FF1744", family="Inter"),
+        )
+
     # Volume bars (color-coded)
     colors = ["#00C853" if c >= o else "#FF3D00" for c, o in zip(df["close"], df["open"])]
     fig.add_trace(go.Bar(
@@ -859,7 +912,7 @@ def build_candlestick_chart(
 
     # Dark theme layout
     fig.update_layout(
-        height=460,
+        height=500,
         margin=dict(t=10, b=10, l=8, r=8),
         paper_bgcolor="#0e1117",
         plot_bgcolor="#0e1117",
@@ -1087,7 +1140,11 @@ with hdr1:
         unsafe_allow_html=True,
     )
 with hdr2:
-    auto_refresh = st.toggle("Auto ⟳ 15s", value=True)
+    st.markdown(
+        f'<div style="text-align:right;padding-top:6px;font-size:0.72rem;color:#546E7A;">'
+        f'{datetime.now(timezone.utc).strftime("%H:%M UTC")}</div>',
+        unsafe_allow_html=True,
+    )
 
 # ── Sidebar Config ──
 with st.sidebar:
@@ -1194,11 +1251,16 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
         # ── Interactive Candlestick Chart ──
         st.markdown(
             "<p style='font-size:0.78rem;font-weight:700;color:#78909C;margin:0 0 2px;'>"
-            "5-MIN CANDLESTICK — VWAP · EMA 9/21 · SUPERTREND · VOLUME</p>",
+            "5-MIN CANDLESTICK — VWAP · EMA 9/21 · SUPERTREND · ENTRY/SL/TGT · VOLUME</p>",
             unsafe_allow_html=True,
         )
         st.plotly_chart(
-            build_candlestick_chart(enriched_df, pred.signal, tech),
+            build_candlestick_chart(
+                enriched_df, pred.signal, tech,
+                entry_price=pred.entry_premium,
+                target_price=pred.target,
+                stop_loss=pred.stop_loss,
+            ),
             width="stretch", config={"displayModeBar": False},
         )
 
@@ -1234,14 +1296,16 @@ for idx, symbol in enumerate(["NIFTY", "BANKNIFTY"]):
                 st.dataframe(hdf, width="stretch", hide_index=True)
 
 
-# ── Footer with Auto-Refresh ──
+# ── Footer ──
 st.markdown(
     f'<div style="text-align:center;padding:10px 0;color:#455A64;font-size:0.72rem;">'
-    f'⚡ {"Auto-refreshing every 15s" if auto_refresh else "Manual refresh"}'
+    f'⚡ Click "🔄 Refresh Data" to fetch the latest snapshot'
     f' | Tick: {datetime.now(timezone.utc).strftime("%H:%M:%S UTC")}</div>',
     unsafe_allow_html=True,
 )
 
-if auto_refresh:
-    time.sleep(15)
-    st.rerun()
+# Manual refresh button instead of auto-refresh loop
+col_r1, col_r2, col_r3 = st.columns([1, 1, 1])
+with col_r2:
+    if st.button("🔄 Refresh Data", type="primary"):
+        st.rerun()
